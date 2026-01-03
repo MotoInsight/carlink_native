@@ -9,11 +9,11 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "zeno.carlink"
+        applicationId = "com.werksmangm.cpaaplayer"
         minSdk = 32
         targetSdk = 36
-        versionCode = 29
-        versionName = "1.0.0"
+        versionCode = 49
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

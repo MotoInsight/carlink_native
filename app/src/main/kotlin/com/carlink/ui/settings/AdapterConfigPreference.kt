@@ -487,7 +487,7 @@ class AdapterConfigPreference private constructor(
         companion object {
             val DEFAULT =
                 UserConfig(
-                    audioTransferMode = false, // ADAPTER is default
+                    audioTransferMode = true, // BLUETOOTH is default
                     sampleRate = SampleRateConfig.DEFAULT,
                     micSource = MicSourceConfig.DEFAULT,
                     wifiBand = WiFiBandConfig.DEFAULT,

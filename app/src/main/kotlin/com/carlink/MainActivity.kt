@@ -245,41 +245,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeCarlinkManager() {
-        // Get window metrics to determine USABLE area (excluding system UI)
-        // This matches Flutter's DisplayMetricsHandler.handleGetWindowBounds() approach
-        // Using WindowMetrics API (minSdk 32 guarantees API 30+ availability)
-        val windowMetrics = windowManager.currentWindowMetrics
-        val bounds = windowMetrics.bounds
-        val windowInsets = windowMetrics.windowInsets
-
-        // Get system bars insets (status bar, navigation bar, display cutouts)
-        val insets =
-            windowInsets.getInsetsIgnoringVisibility(
-                android.view.WindowInsets.Type
-                    .systemBars() or
-                    android.view.WindowInsets.Type
-                        .displayCutout(),
-            )
-
-        // Calculate usable dimensions (window bounds minus system UI)
-        val usableWidth = bounds.width() - insets.left - insets.right
-        val usableHeight = bounds.height() - insets.top - insets.bottom
-
-        // Get DPI and refresh rate from display metrics
-        val displayMetrics = resources.displayMetrics
-        val dpi = displayMetrics.densityDpi
-        val refreshRate = windowManager.defaultDisplay.refreshRate.toInt()
-
-        // Round to even numbers for H.264 compatibility
-        val evenWidth = usableWidth and 1.inv()
-        val evenHeight = usableHeight and 1.inv()
-
         // Load icons from assets for adapter initialization
         val (icon120, icon180, icon256) = IconAssets.loadIcons(this)
         val iconsLoaded = icon120 != null && icon180 != null && icon256 != null
 
         // Load user-configured adapter settings from sync cache (instant, no I/O blocking)
-        // These are optional - only configured settings are sent to the adapter
         val userConfig = AdapterConfigPreference.getInstance(this).getUserConfigSync()
 
         // Map user config enums to AdapterConfig values
@@ -294,10 +264,14 @@ class MainActivity : ComponentActivity() {
                 com.carlink.ui.settings.WiFiBandConfig.BAND_24GHZ -> "24ghz"
             }
 
+        // Get refresh rate and DPI (these are safe to read early)
+        val refreshRate = windowManager.defaultDisplay.refreshRate.toInt()
+        val dpi = resources.displayMetrics.densityDpi
+
         val config =
             AdapterConfig(
-                width = evenWidth,
-                height = evenHeight,
+                width = 0,           // Will be set later from actual VideoSurface size
+                height = 0,          // Will be set later from actual VideoSurface size
                 fps = refreshRate,
                 dpi = dpi,
                 icon120Data = icon120,
@@ -314,12 +288,13 @@ class MainActivity : ComponentActivity() {
             )
 
         logInfo(
-            "[WINDOW] Bounds: ${bounds.width()}x${bounds.height()}, " +
-                "Usable: ${usableWidth}x$usableHeight, " +
-                "Insets: T:${insets.top} B:${insets.bottom} L:${insets.left} R:${insets.right}",
+            "Creating CarlinkManager - resolution will be configured dynamically from VideoSurface",
             tag = "MAIN",
         )
-        logInfo("Display config: ${config.width}x${config.height}@${config.fps}fps, ${config.dpi}dpi", tag = "MAIN")
+        logInfo(
+            "Display config: ${config.width}x${config.height}@${config.fps}fps, ${config.dpi}dpi (initial placeholders)",
+            tag = "MAIN",
+        )
         logInfo(
             "Icons loaded: $iconsLoaded (120: ${icon120?.size ?: 0}B, 180: ${icon180?.size ?: 0}B, 256: ${icon256?.size ?: 0}B)",
             tag = "MAIN",

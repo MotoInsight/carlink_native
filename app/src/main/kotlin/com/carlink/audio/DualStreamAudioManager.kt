@@ -3,7 +3,6 @@ package com.carlink.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.os.Build
 import android.os.Process
 import android.util.Log
 import com.carlink.BuildConfig
@@ -136,7 +135,8 @@ class DualStreamAudioManager(
     // Minimum buffer level (ms) to maintain during playback
     // This prevents draining the buffer to 0ms which causes underruns
     // Keep at least this much data in the ring buffer as headroom for USB jitter
-    private val minBufferLevelMs = 100
+    // Reduced from 100ms to 50ms based on captured USB data showing P99 jitter of only 7ms
+    private val minBufferLevelMs = 50
 
     // Track whether each stream has started playing (for pre-fill logic)
     @Volatile private var mediaStarted = false
@@ -168,6 +168,11 @@ class DualStreamAudioManager(
     // Flush buffer after multiple consecutive zero packets to prevent noise from resampling
     private var consecutiveNavZeroPackets: Int = 0
     private val navZeroFlushThreshold = 3 // Flush after 3 consecutive zero packets
+
+    // Navigation stopped state - stop accepting nav packets after NAVI_STOP until next NAVI_START
+    // USB captures show adapter sends ~2 seconds of silence after NAVI_STOP before NAVI_COMPLETE
+    // These silence packets should be dropped to prevent playback artifacts
+    @Volatile private var navStopped = false
 
     @Volatile private var voiceStarted = false
 
@@ -487,6 +492,13 @@ class DualStreamAudioManager(
 
             AudioStreamType.NAVIGATION -> {
                 // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → CarAudioContext.NAVIGATION
+
+                // Drop nav packets after NAVI_STOP received (until next NAVI_START)
+                // USB captures show ~2 seconds of silence packets sent after NAVI_STOP
+                if (navStopped) {
+                    return 0
+                }
+
                 val bufferLevelMs = navBuffer?.fillLevelMs() ?: 0
 
                 // Check for end marker FIRST (before ensuring track)
@@ -677,8 +689,23 @@ class DualStreamAudioManager(
     // when the stream restarts, avoiding audio glitches.
 
     /**
+     * Signal navigation stream stopped - stop accepting new nav packets.
+     * Called when AUDIO_NAVI_STOP command is received from the adapter.
+     *
+     * USB captures show adapter sends ~2 seconds of silence packets after NAVI_STOP
+     * before finally sending NAVI_COMPLETE. This method prevents those silence
+     * packets from being written to the buffer, avoiding playback artifacts.
+     *
+     * The actual track cleanup happens when NAVI_COMPLETE is received.
+     */
+    fun onNavStopped() {
+        log("[NAV_STOP] onNavStopped() called - will reject incoming nav packets")
+        navStopped = true
+    }
+
+    /**
      * Pause navigation AudioTrack when nav audio stream ends.
-     * Called when AudioNaviStop command is received from the adapter.
+     * Called when AUDIO_NAVI_COMPLETE command is received from the adapter.
      *
      * Enforces minimum playback duration to prevent premature cutoff when adapter
      * sends stop command too quickly (observed in Sessions 1-2).
@@ -687,9 +714,8 @@ class DualStreamAudioManager(
         log("[NAV_STOP] stopNavTrack() called")
 
         synchronized(lock) {
-            val trackState = navTrack?.playState
             val trackStateStr =
-                when (trackState) {
+                when (val trackState = navTrack?.playState) {
                     AudioTrack.PLAYSTATE_PLAYING -> "PLAYING"
                     AudioTrack.PLAYSTATE_PAUSED -> "PAUSED"
                     AudioTrack.PLAYSTATE_STOPPED -> "STOPPED"
@@ -738,6 +764,7 @@ class DualStreamAudioManager(
             }
 
             navStarted = false
+            navStopped = false // Reset stopped state for next nav session
             navPackets = 0 // Reset packet counter for next nav prompt
             navUnderruns = 0 // Reset underrun counter for next nav prompt
         }
@@ -957,6 +984,9 @@ class DualStreamAudioManager(
         val format = AudioFormats.fromDecodeType(decodeType)
 
         synchronized(lock) {
+            // Reset stopped state - new nav session starting
+            navStopped = false
+
             // Resume paused track if same format
             navTrack?.let { track ->
                 if (track.playState == AudioTrack.PLAYSTATE_PAUSED && navFormat == format) {
@@ -1419,7 +1449,15 @@ class DualStreamAudioManager(
                                     if (toRead > 0) {
                                         val bytesRead = buffer.read(navTempBuffer, 0, toRead)
                                         if (bytesRead > 0) {
-                                            val written = track.write(navTempBuffer, 0, bytesRead)
+                                            // Use WRITE_NON_BLOCKING to prevent thread starvation
+                                            // across multiple streams (media/nav/voice/call)
+                                            val written =
+                                                track.write(
+                                                    navTempBuffer,
+                                                    0,
+                                                    bytesRead,
+                                                    AudioTrack.WRITE_NON_BLOCKING,
+                                                )
                                             if (written < 0) {
                                                 handleTrackError("NAV", written)
                                             } else {
@@ -1465,7 +1503,15 @@ class DualStreamAudioManager(
                                     val toRead = minOf(available, playbackChunkSize)
                                     val bytesRead = buffer.read(voiceTempBuffer, 0, toRead)
                                     if (bytesRead > 0) {
-                                        val written = track.write(voiceTempBuffer, 0, bytesRead)
+                                        // Use WRITE_NON_BLOCKING to prevent thread starvation
+                                        // across multiple streams (media/nav/voice/call)
+                                        val written =
+                                            track.write(
+                                                voiceTempBuffer,
+                                                0,
+                                                bytesRead,
+                                                AudioTrack.WRITE_NON_BLOCKING,
+                                            )
                                         if (written < 0) {
                                             handleTrackError("VOICE", written)
                                         }
@@ -1507,7 +1553,15 @@ class DualStreamAudioManager(
                                     val toRead = minOf(available, playbackChunkSize)
                                     val bytesRead = buffer.read(callTempBuffer, 0, toRead)
                                     if (bytesRead > 0) {
-                                        val written = track.write(callTempBuffer, 0, bytesRead)
+                                        // Use WRITE_NON_BLOCKING to prevent thread starvation
+                                        // across multiple streams (media/nav/voice/call)
+                                        val written =
+                                            track.write(
+                                                callTempBuffer,
+                                                0,
+                                                bytesRead,
+                                                AudioTrack.WRITE_NON_BLOCKING,
+                                            )
                                         if (written < 0) {
                                             handleTrackError("CALL", written)
                                         }

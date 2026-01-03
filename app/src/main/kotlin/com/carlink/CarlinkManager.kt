@@ -282,7 +282,7 @@ class CarlinkManager(
                     this@CarlinkManager.callback = finalCallback
                     this@CarlinkManager.videoSurface = finalSurface
                     // Resume with new surface - this calls setOutputSurface() internally
-                    h264Renderer?.resume(finalSurface)
+                    h264Renderer?.resume()
                 }
             return
         }
@@ -722,9 +722,6 @@ class CarlinkManager(
      */
     fun resumeVideo() {
         logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
-
-        // If surface is null (destroyed and not yet recreated), skip resume.
-        // initialize() will handle resume when new Surface becomes available.
         val surface = videoSurface
         if (surface == null || !surface.isValid) {
             logInfo(
@@ -733,16 +730,12 @@ class CarlinkManager(
             )
             return
         }
-
-        // Pass current surface to resume
-        h264Renderer?.resume(surface)
-
-        // Also request keyframe through adapter if connected
+        // Use no-arg resume()
+        h264Renderer?.resume()
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
             adapterDriver?.sendCommand(CommandMapping.FRAME)
         }
     }
-
     // ==================== Private Methods ====================
 
     private fun setState(newState: State) {

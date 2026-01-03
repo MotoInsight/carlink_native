@@ -1,5 +1,7 @@
 package com.carlink.ui
 
+import android.app.Activity
+
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.view.HapticFeedbackConstants
@@ -77,6 +79,7 @@ import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SettingsInputComponent
 import androidx.compose.material.icons.filled.SignalCellularAlt
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Usb
@@ -154,7 +157,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
+import android.content.Intent
+import kotlinx.coroutines.delay
 /**
  * Settings Screen - NavigationRail Settings Interface
  *
@@ -176,17 +180,15 @@ fun SettingsScreen(
 ) {
     var selectedTab by remember { mutableStateOf(SettingsTab.CONTROL) }
     val context = LocalContext.current
-    val colorScheme = MaterialTheme.colorScheme
-
+    val activity = remember(context) { context as? ComponentActivity }
+    val color = MaterialTheme.colorScheme
     // Log settings screen entry and tab changes
     LaunchedEffect(Unit) {
         logInfo("[UI_STATE] SettingsScreen opened - user is in app settings (NOT viewing CarPlay projection)", tag = "UI")
     }
-
     LaunchedEffect(selectedTab) {
         logInfo("[UI_STATE] Settings tab changed: $selectedTab", tag = "UI")
     }
-
     // Get app version
     val appVersion =
         remember {
@@ -198,16 +200,14 @@ fun SettingsScreen(
                 "Unknown"
             }
         }
-
     // Get view for haptic feedback - Matches Flutter HapticFeedback.lightImpact()
     val view = LocalView.current
-
     // Matches Flutter SafeArea - Apply system bar insets
     // Surface provides opaque background when used as overlay
     // Use colorScheme.surface to match NavigationRail containerColor
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = colorScheme.surface,
+        color = color.surface,
     ) {
         Row(
             modifier =
@@ -237,12 +237,11 @@ fun SettingsScreen(
                         )
                     }
                 }
-
                 // NavigationRail with tabs - Expanded to fill available space
                 // Items centered vertically to match Flutter NavigationRail behavior
                 NavigationRail(
                     modifier = Modifier.weight(1f),
-                    containerColor = colorScheme.surface,
+                    containerColor = color.surface,
                 ) {
                     Spacer(modifier = Modifier.weight(1f))
                     SettingsTab.visibleTabs.forEach { tab ->
@@ -264,7 +263,6 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.weight(1f))
                 }
-
                 // App version at bottom - always visible after NavigationRail
                 Row(
                     modifier = Modifier.padding(20.dp),
@@ -273,7 +271,7 @@ fun SettingsScreen(
                     Text(
                         text = "Version: ",
                         style = MaterialTheme.typography.bodySmall,
-                        color = colorScheme.onSurfaceVariant,
+                        color = color.onSurfaceVariant,
                     )
                     Text(
                         text = if (appVersion.isEmpty()) "- - -" else appVersion,
@@ -281,11 +279,10 @@ fun SettingsScreen(
                             MaterialTheme.typography.bodySmall.copy(
                                 fontWeight = FontWeight.SemiBold,
                             ),
-                        color = if (appVersion.isEmpty()) colorScheme.onSurfaceVariant else colorScheme.onSurface,
+                        color = if (appVersion.isEmpty()) color.onSurfaceVariant else color.onSurface,
                     )
                 }
             }
-
             // Tab content - fills remaining space
             Box(
                 modifier =
@@ -301,10 +298,8 @@ fun SettingsScreen(
         }
     }
 }
-
 // ==================== CONTROL TAB ====================
 // Matches Flutter: control_tab_content.dart
-
 /**
  * Button severity levels for semantic color mapping (matches Flutter)
  */
@@ -313,7 +308,6 @@ private enum class ButtonSeverity {
     WARNING, // Warning action (tertiary/amber)
     DESTRUCTIVE, // Destructive action (error/red)
 }
-
 /**
  * Control Tab - Device control commands and Display Control
  * Matches Flutter control_tab_content.dart
@@ -323,29 +317,25 @@ private enum class ButtonSeverity {
 private fun ControlTabContent(carlinkManager: CarlinkManager) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val activity = context as? Activity
     var isProcessing by remember { mutableStateOf(false) }
     val colorScheme = MaterialTheme.colorScheme
-
     // Check device connection state - Matches Flutter _isDeviceConnected()
     val isDeviceConnected = carlinkManager.state != CarlinkManager.State.DISCONNECTED
-
     // Display mode preference
     val displayModePreference = remember { DisplayModePreference.getInstance(context) }
     val currentDisplayMode by displayModePreference.displayModeFlow.collectAsStateWithLifecycle(
         initialValue = DisplayMode.SYSTEM_UI_VISIBLE,
     )
     var showDisplayModeDialog by remember { mutableStateOf(false) }
-
     // Adapter configuration preference
     val adapterConfigPreference = remember { AdapterConfigPreference.getInstance(context) }
     var showAdapterConfigDialog by remember { mutableStateOf(false) }
-
     // Responsive max width - 75% of container width, clamped between 400dp and 1200dp
     val windowInfo = LocalWindowInfo.current
     val density = LocalDensity.current
     val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
     val maxContentWidth = (containerWidthDp * 0.75f).coerceIn(400.dp, 1200.dp)
-
     // Centered scrollable content with responsive max width constraint
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -381,9 +371,7 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                             carlinkManager.stop()
                         },
                     )
-
                     Spacer(modifier = Modifier.height(12.dp))
-
                     ControlButton(
                         label = "Close Adapter",
                         icon = Icons.Default.PowerOff,
@@ -395,7 +383,6 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                         },
                     )
                 }
-
                 // System Reset Card - Matches Flutter _buildSystemResetCard
                 ControlCard(
                     modifier = Modifier.weight(1f),
@@ -412,9 +399,7 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                             carlinkManager.resetVideoDecoder()
                         },
                     )
-
                     Spacer(modifier = Modifier.height(12.dp))
-
                     ControlButton(
                         label = "Reset USB Device",
                         icon = Icons.Default.Usb,
@@ -434,7 +419,6 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                     )
                 }
             }
-
             // Two cards side by side (Display Control + Adapter Configuration)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -476,7 +460,6 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                         )
                     }
                 }
-
                 // Adapter Configuration Card
                 ControlCard(
                     modifier = Modifier.weight(1f),
@@ -506,7 +489,6 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
             }
         }
     }
-
     // Adapter Configuration Dialog
     if (showAdapterConfigDialog) {
         AdapterConfigurationDialog(
@@ -515,7 +497,6 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
             onDismiss = { showAdapterConfigDialog = false },
         )
     }
-
     // Display Mode Dialog with live preview
     if (showDisplayModeDialog) {
         DisplayModeDialog(
@@ -523,19 +504,44 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
             onDismiss = { showDisplayModeDialog = false },
             onApplyAndRestart = { newMode ->
                 showDisplayModeDialog = false
+
                 scope.launch {
-                    // Save the new display mode
                     displayModePreference.setDisplayMode(newMode)
-                    // Stop adapter and exit
-                    carlinkManager.stop()
-                    kotlinx.coroutines.delay(500)
-                    android.os.Process.killProcess(android.os.Process.myPid())
+
+                    // If carlinkManager is NOT nullable, call release() directly
+                    // carlinkManager.release()
+                    // If it IS nullable, keep the safe call:
+                    carlinkManager?.release()
+
+                    // Give release time to complete
+                    kotlinx.coroutines.delay(800)
+
+                    // If we don't have an Activity (preview / unusual context), just stop here
+                    val a = activity ?: return@launch
+
+                    // Finish all activities in the task
+                    a.finishAffinity()
+
+                    // Relaunch the app cleanly
+                    val intent = a.packageManager.getLaunchIntentForPackage(a.packageName)
+                        ?.addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+
+                    if (intent != null) {
+                        // Use the Activity (or applicationContext) to start the launch intent
+                        a.startActivity(intent)
+                    }
+
+                    // Optional hard exit if needed:
+                    // Runtime.getRuntime().exit(0)
                 }
             },
         )
     }
 }
-
 /**
  * Material 3 Control Card container
  */
@@ -547,7 +553,6 @@ private fun ControlCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Card(
         modifier = modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
@@ -577,172 +582,11 @@ private fun ControlCard(
                     modifier = Modifier.weight(1f, fill = false),
                 )
             }
-
             Spacer(modifier = Modifier.height(20.dp))
-
             content()
         }
     }
 }
-
-/**
- * Material 3 Control Button with animated state transitions
- */
-@Composable
-private fun ControlButton(
-    label: String,
-    icon: ImageVector,
-    severity: ButtonSeverity,
-    enabled: Boolean,
-    isProcessing: Boolean,
-    onClick: () -> Unit,
-) {
-    val colorScheme = MaterialTheme.colorScheme
-
-    when (severity) {
-        ButtonSeverity.DESTRUCTIVE -> {
-            Button(
-                onClick = onClick,
-                enabled = enabled && !isProcessing,
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(AutomotiveDimens.ButtonMinHeight),
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor = colorScheme.error,
-                        contentColor = colorScheme.onError,
-                    ),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
-            ) {
-                AnimatedContent(
-                    targetState = isProcessing,
-                    transitionSpec = {
-                        (fadeIn() + scaleIn()).togetherWith(fadeOut() + scaleOut())
-                    },
-                    label = "iconTransition",
-                ) { processing ->
-                    if (processing) {
-                        LoadingSpinner(
-                            size = 24.dp,
-                            color = colorScheme.onError,
-                        )
-                    } else {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = label,
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-            }
-        }
-
-        ButtonSeverity.WARNING -> {
-            FilledTonalButton(
-                onClick = onClick,
-                enabled = enabled && !isProcessing,
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(AutomotiveDimens.ButtonMinHeight),
-                colors =
-                    ButtonDefaults.filledTonalButtonColors(
-                        containerColor = colorScheme.tertiaryContainer,
-                        contentColor = colorScheme.onTertiaryContainer,
-                    ),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
-            ) {
-                AnimatedContent(
-                    targetState = isProcessing,
-                    transitionSpec = {
-                        (fadeIn() + scaleIn()).togetherWith(fadeOut() + scaleOut())
-                    },
-                    label = "iconTransition",
-                ) { processing ->
-                    if (processing) {
-                        LoadingSpinner(
-                            size = 24.dp,
-                        )
-                    } else {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = label,
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-            }
-        }
-
-        ButtonSeverity.NORMAL -> {
-            FilledTonalButton(
-                onClick = onClick,
-                enabled = enabled && !isProcessing,
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(AutomotiveDimens.ButtonMinHeight),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp),
-            ) {
-                AnimatedContent(
-                    targetState = isProcessing,
-                    transitionSpec = {
-                        (fadeIn() + scaleIn()).togetherWith(fadeOut() + scaleOut())
-                    },
-                    label = "iconTransition",
-                ) { processing ->
-                    if (processing) {
-                        LoadingSpinner(
-                            size = 24.dp,
-                        )
-                    } else {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = label,
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-// ==================== ADAPTER CONFIGURATION DIALOG ====================
-
-/**
- * Adapter Configuration Dialog
- *
- * Scrollable popup dialog for configuring adapter initialization settings.
- * Designed to be extensible - new configuration options can be easily added.
- *
- * Structure:
- * - Header with icon and title
- * - Scrollable content with configuration options
- * - Footer with Save/Default/Cancel buttons
- */
 @Composable
 private fun AdapterConfigurationDialog(
     adapterConfigPreference: AdapterConfigPreference,
@@ -1114,7 +958,73 @@ private fun AdapterConfigurationDialog(
         }
     }
 }
+/**
+ * Material 3 Control Button with animated state transitions
+ */
+@Composable
+private fun ControlButton(
+    label: String,
+    icon: ImageVector,
+    severity: ButtonSeverity,
+    enabled: Boolean,
+    isProcessing: Boolean,
+    onClick: () -> Unit,
+) {
+    val colorScheme = MaterialTheme.colorScheme
 
+    val (containerColor, contentColor) = when (severity) {
+        ButtonSeverity.DESTRUCTIVE -> colorScheme.error to colorScheme.onError
+        ButtonSeverity.WARNING -> colorScheme.tertiaryContainer to colorScheme.onTertiaryContainer
+        ButtonSeverity.NORMAL -> colorScheme.primaryContainer to colorScheme.onPrimaryContainer
+    }
+
+    val commonModifier = Modifier
+        .fillMaxWidth()
+        .height(AutomotiveDimens.ButtonMinHeight)
+
+    val commonPadding = PaddingValues(horizontal = 24.dp, vertical = 16.dp)
+
+    if (severity == ButtonSeverity.DESTRUCTIVE) {
+        Button(
+            onClick = onClick,
+            enabled = enabled && !isProcessing,
+            modifier = commonModifier,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = containerColor,
+                contentColor = contentColor
+            ),
+            contentPadding = commonPadding
+        ) {
+            ButtonContent(isProcessing, icon, label, contentColor)
+        }
+    } else {
+        FilledTonalButton(
+            onClick = onClick,
+            enabled = enabled && !isProcessing,
+            modifier = commonModifier,
+            colors = ButtonDefaults.filledTonalButtonColors(
+                containerColor = containerColor,
+                contentColor = contentColor
+            ),
+            contentPadding = commonPadding
+        ) {
+            ButtonContent(isProcessing, icon, label, contentColor)
+        }
+    }
+}
+
+// ==================== ADAPTER CONFIGURATION DIALOG ====================
+/**
+ * Adapter Configuration Dialog
+ *
+ * Scrollable popup dialog for configuring adapter initialization settings.
+ * Designed to be extensible - new configuration options can be easily added.
+ *
+ * Structure:
+ * - Header with icon and title
+ * - Scrollable content with configuration options
+ * - Footer with Save/Default/Cancel buttons
+ */
 /**
  * Configuration Option Card - Container for a single configuration option
  *
@@ -1129,7 +1039,6 @@ private fun ConfigurationOptionCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
@@ -1157,24 +1066,19 @@ private fun ConfigurationOptionCard(
                         ),
                 )
             }
-
             Spacer(modifier = Modifier.height(4.dp))
-
             // Description
             Text(
                 text = description,
                 style = MaterialTheme.typography.bodySmall,
                 color = colorScheme.onSurfaceVariant,
             )
-
             Spacer(modifier = Modifier.height(12.dp))
-
             // Option content
             content()
         }
     }
 }
-
 /**
  * Audio Source Selection Button
  *
@@ -1189,7 +1093,6 @@ private fun AudioSourceButton(
     modifier: Modifier = Modifier,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     // Animated properties for smooth selection transitions
     val backgroundColor by animateColorAsState(
         targetValue = if (isSelected) colorScheme.primaryContainer else colorScheme.surfaceContainer,
@@ -1211,7 +1114,6 @@ private fun AudioSourceButton(
         targetValue = if (isSelected) 1.1f else 1f,
         label = "iconScale",
     )
-
     Surface(
         onClick = onClick,
         modifier = modifier.height(AutomotiveDimens.ButtonMinHeight),
@@ -1257,9 +1159,7 @@ private fun AudioSourceButton(
         }
     }
 }
-
 // ==================== DISPLAY MODE DIALOG ====================
-
 /**
  * Display Mode Dialog with Live Preview
  *
@@ -1280,43 +1180,30 @@ private fun DisplayModeDialog(
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val context = LocalContext.current
-
     // Get window for live preview
     val window = (context as? ComponentActivity)?.window
-
     // Load saved mode from preferences
     val savedMode by displayModePreference.displayModeFlow.collectAsStateWithLifecycle(
         initialValue = DisplayMode.SYSTEM_UI_VISIBLE,
     )
-
     // Local state for preview - allows cancel without saving
-    var selectedMode by remember { mutableStateOf(savedMode) }
-
-    // Sync local state when saved value loads (for initial load)
-    LaunchedEffect(savedMode) {
-        selectedMode = savedMode
-    }
-
+    var selectedMode by remember(savedMode) { mutableStateOf(savedMode) }
     // LIVE PREVIEW: Apply mode instantly when selection changes
     LaunchedEffect(selectedMode) {
         window?.let { applyDisplayModePreview(it, selectedMode) }
     }
-
     // Restore original mode when dialog dismissed without saving
     DisposableEffect(Unit) {
         onDispose {
             window?.let { applyDisplayModePreview(it, savedMode) }
         }
     }
-
     val hasChanges = selectedMode != savedMode
-
     // Responsive dialog width - 60% of container width, clamped between 320dp and 600dp
     val windowInfo = LocalWindowInfo.current
     val density = LocalDensity.current
     val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
     val dialogMaxWidth = (containerWidthDp * 0.6f).coerceIn(320.dp, 600.dp)
-
     Dialog(onDismissRequest = {
         // Restore original mode on cancel
         window?.let { applyDisplayModePreview(it, savedMode) }
@@ -1350,18 +1237,14 @@ private fun DisplayModeDialog(
                             ),
                     )
                 }
-
                 Spacer(modifier = Modifier.height(8.dp))
-
                 // Subtitle with preview indicator
                 Text(
                     text = "Preview changes instantly • Restart required to apply",
                     style = MaterialTheme.typography.bodyMedium,
                     color = colorScheme.onSurfaceVariant,
                 )
-
                 Spacer(modifier = Modifier.height(20.dp))
-
                 // Scrollable content area
                 Column(
                     modifier =
@@ -1403,7 +1286,6 @@ private fun DisplayModeDialog(
                                 modifier = Modifier.weight(1f),
                             )
                         }
-
                         // Description for selected mode
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
@@ -1412,11 +1294,9 @@ private fun DisplayModeDialog(
                                     DisplayMode.SYSTEM_UI_VISIBLE -> {
                                         "Status bar and navigation always visible. AAOS manages display bounds."
                                     }
-
                                     DisplayMode.STATUS_BAR_HIDDEN -> {
                                         "Status bar hidden, navigation bar visible. Extra vertical space."
                                     }
-
                                     DisplayMode.FULLSCREEN_IMMERSIVE -> {
                                         "All system UI hidden. Swipe edge to temporarily reveal."
                                     }
@@ -1426,9 +1306,7 @@ private fun DisplayModeDialog(
                         )
                     }
                 }
-
                 Spacer(modifier = Modifier.height(24.dp))
-
                 // Footer with action buttons
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1444,7 +1322,6 @@ private fun DisplayModeDialog(
                     ) {
                         Text("Cancel")
                     }
-
                     // Apply & Restart
                     Button(
                         onClick = { onApplyAndRestart(selectedMode) },
@@ -1464,7 +1341,6 @@ private fun DisplayModeDialog(
         }
     }
 }
-
 /**
  * Applies the display mode preview by showing/hiding system bars.
  * Used for instant visual feedback in the DisplayModeDialog.
@@ -1474,30 +1350,31 @@ private fun applyDisplayModePreview(
     mode: DisplayMode,
 ) {
     val controller = WindowCompat.getInsetsController(window, window.decorView)
-
     when (mode) {
         DisplayMode.SYSTEM_UI_VISIBLE -> {
-            // Show all system bars - let AAOS manage display bounds
+            // Show both status and navigation bars
             controller.show(WindowInsetsCompat.Type.systemBars())
+            // Default behavior: bars are persistent
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
         }
-
         DisplayMode.STATUS_BAR_HIDDEN -> {
-            // Hide status bar only, keep navigation bar visible
+            // Hide status bar only
             controller.hide(WindowInsetsCompat.Type.statusBars())
+            // Ensure navigation bar remains visible
             controller.show(WindowInsetsCompat.Type.navigationBars())
+            // Allow transient reveal by swipe (optional polish)
             controller.systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
-
         DisplayMode.FULLSCREEN_IMMERSIVE -> {
-            // Hide all system bars for maximum projection area
+            // Hide all system bars
             controller.hide(WindowInsetsCompat.Type.systemBars())
+            // Swipe from edge to temporarily reveal
             controller.systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 }
-
 /**
  * Display Mode Selection Button
  *
@@ -1513,7 +1390,6 @@ private fun DisplayModeButton(
     modifier: Modifier = Modifier,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     // Animated properties for smooth selection transitions
     val backgroundColor by animateColorAsState(
         targetValue = if (isSelected) colorScheme.primaryContainer else colorScheme.surfaceContainer,
@@ -1535,7 +1411,6 @@ private fun DisplayModeButton(
         targetValue = if (isSelected) 1.1f else 1f,
         label = "iconScale",
     )
-
     Surface(
         onClick = onClick,
         modifier = modifier.height(AutomotiveDimens.ButtonMinHeight),
@@ -1581,10 +1456,8 @@ private fun DisplayModeButton(
         }
     }
 }
-
 // ==================== LOGS TAB ====================
 // Matches Flutter: logs_tab_content.dart
-
 /**
  * Logs Tab - Log file management with log level selector
  * Matches Flutter logs_tab_content.dart
@@ -1600,12 +1473,10 @@ private fun LogsTabContent(
     var showLogLevelDialog by remember { mutableStateOf(false) }
     var showDebugWarningDialog by remember { mutableStateOf(false) }
     val colorScheme = MaterialTheme.colorScheme
-
     // File export state - stores the file to export when SAF picker returns
     // Using both pendingExportFile and isExporting prevents race conditions on rapid clicks
     var pendingExportFile by remember { mutableStateOf<File?>(null) }
     var isExporting by remember { mutableStateOf(false) }
-
     // SAF Document Creator launcher - matches Flutter ACTION_CREATE_DOCUMENT
     // Lifecycle-aware registration handled by Compose; I/O delegated to FileExportService
     val createDocumentLauncher =
@@ -1635,30 +1506,25 @@ private fun LogsTabContent(
                 isExporting = false
             }
         }
-
     // Logging preferences
     val loggingPreferences = remember { LoggingPreferences.getInstance(context) }
     val isLoggingEnabled by loggingPreferences.loggingEnabledFlow.collectAsStateWithLifecycle(initialValue = true)
     val currentLogLevel by loggingPreferences.logLevelFlow.collectAsStateWithLifecycle(initialValue = LogPreset.NORMAL)
-
     // Check if debug build
     val isDebugBuild =
         remember {
             try {
                 val appInfo = context.packageManager.getApplicationInfo(context.packageName, 0)
                 (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-            } catch (e: PackageManager.NameNotFoundException) {
+            } catch (e: SecurityException) {
                 logWarn("[SettingsScreen] Failed to check debug build status: ${e.message}")
                 false
             }
         }
-
     val dateFormat = remember { SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()) }
-
     LaunchedEffect(fileLogManager) {
         logFiles = fileLogManager?.getLogFiles() ?: emptyList()
     }
-
     if (fileLogManager == null) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -1672,13 +1538,11 @@ private fun LogsTabContent(
         }
         return
     }
-
     // Responsive max width - 75% of container width, clamped between 400dp and 1200dp
     val windowInfo = LocalWindowInfo.current
     val density = LocalDensity.current
     val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
     val maxContentWidth = (containerWidthDp * 0.75f).coerceIn(400.dp, 1200.dp)
-
     // Centered scrollable content with responsive max width constraint
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -1740,10 +1604,8 @@ private fun LogsTabContent(
                         },
                     )
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
-                // Log Level Selector - Matches Flutter _buildLogLevelSelector exactly
+                // Log level selector - Matches Flutter _buildLogLevelSelector exactly
                 // Uses a tappable container box, not a button
                 Column {
                     Text(
@@ -1789,12 +1651,10 @@ private fun LogsTabContent(
                         }
                     }
                 }
-
                 // File Logging Status - Embedded inside File Logging card
                 // Matches Flutter _buildFileLoggingStatusRows (inside same card)
                 val totalSize = fileLogManager.getTotalLogSize()
                 val currentFileSize = fileLogManager.getCurrentLogFileSize()
-
                 if (isLoggingEnabled || logFiles.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(16.dp))
                     Surface(
@@ -1831,7 +1691,6 @@ private fun LogsTabContent(
                     }
                 }
             }
-
             // Log Files Card - Matches Flutter _buildLogFilesCardWithActions
             LoggingControlCard(
                 title = "Log Files",
@@ -1844,7 +1703,6 @@ private fun LogsTabContent(
                     color = colorScheme.onSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-
                 // Log file items with export button - Matches Flutter _buildLogFileItem
                 logFiles.forEach { file ->
                     LogFileItem(
@@ -1865,7 +1723,6 @@ private fun LogsTabContent(
                         },
                     )
                 }
-
                 // Help text - Matches Flutter
                 if (logFiles.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(12.dp))
@@ -1880,7 +1737,6 @@ private fun LogsTabContent(
             }
         }
     }
-
     // Log Level Selector Dialog - Matches Flutter _LogLevelSelectorDialog
     if (showLogLevelDialog) {
         LogLevelSelectorDialog(
@@ -1895,7 +1751,6 @@ private fun LogsTabContent(
             },
         )
     }
-
     // Debug APK Warning Dialog - Matches Flutter _DebugApkWarningDialog
     if (showDebugWarningDialog) {
         AlertDialog(
@@ -1926,7 +1781,6 @@ private fun LogsTabContent(
             },
         )
     }
-
     // Delete confirmation dialog - Matches Flutter DeleteConfirmationDialog
     showDeleteDialog?.let { file ->
         val fileSize =
@@ -1937,7 +1791,6 @@ private fun LogsTabContent(
                 0L
             }
         val fileSizeStr = formatBytes(fileSize)
-
         Dialog(onDismissRequest = { showDeleteDialog = null }) {
             Surface(
                 shape = MaterialTheme.shapes.extraLarge,
@@ -1969,9 +1822,7 @@ private fun LogsTabContent(
                             modifier = Modifier.size(32.dp),
                         )
                     }
-
                     Spacer(modifier = Modifier.height(16.dp))
-
                     // Title
                     Text(
                         text = "Delete Log File?",
@@ -1981,9 +1832,7 @@ private fun LogsTabContent(
                             ),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     )
-
                     Spacer(modifier = Modifier.height(16.dp))
-
                     // File information box - Matches Flutter buildContentBox
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -2028,9 +1877,7 @@ private fun LogsTabContent(
                             }
                         }
                     }
-
                     Spacer(modifier = Modifier.height(16.dp))
-
                     // File name box
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -2057,9 +1904,7 @@ private fun LogsTabContent(
                             )
                         }
                     }
-
                     Spacer(modifier = Modifier.height(16.dp))
-
                     // Warning box - Matches Flutter buildWarningBox
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -2093,9 +1938,7 @@ private fun LogsTabContent(
                             )
                         }
                     }
-
                     Spacer(modifier = Modifier.height(24.dp))
-
                     // Action buttons - Matches Flutter layout
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2134,7 +1977,6 @@ private fun LogsTabContent(
         }
     }
 }
-
 /**
  * Log Level Selector Dialog - 2-column layout
  * Matches Flutter _LogLevelSelectorDialog exactly with:
@@ -2150,7 +1992,6 @@ private fun LogLevelSelectorDialog(
     onSelectLevel: (LogPreset) -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     // Define preset order matching Flutter exactly
     val leftColumn =
         listOf(
@@ -2166,7 +2007,6 @@ private fun LogLevelSelectorDialog(
             LogPreset.AUDIO_ONLY,
             LogPreset.DEBUG,
         )
-
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = MaterialTheme.shapes.extraLarge,
@@ -2198,9 +2038,7 @@ private fun LogLevelSelectorDialog(
                             ),
                     )
                 }
-
                 Spacer(modifier = Modifier.height(20.dp))
-
                 // Two columns with specific preset order
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -2229,9 +2067,7 @@ private fun LogLevelSelectorDialog(
                         }
                     }
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
                 // Cancel button aligned right
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -2245,7 +2081,6 @@ private fun LogLevelSelectorDialog(
         }
     }
 }
-
 /**
  * Log Preset Chip for selector dialog
  * Matches Flutter _buildLogLevelOption exactly
@@ -2257,7 +2092,6 @@ private fun LogPresetChip(
     onClick: () -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Surface(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
@@ -2300,9 +2134,7 @@ private fun LogPresetChip(
                     )
                 }
             }
-
             Spacer(modifier = Modifier.width(12.dp))
-
             // Level info
             Column(
                 modifier = Modifier.weight(1f),
@@ -2326,7 +2158,6 @@ private fun LogPresetChip(
         }
     }
 }
-
 /**
  * Material 3 Logging Control Card container
  */
@@ -2338,7 +2169,6 @@ private fun LoggingControlCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Card(
         modifier = modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
@@ -2368,14 +2198,11 @@ private fun LoggingControlCard(
                     modifier = Modifier.weight(1f, fill = false),
                 )
             }
-
             Spacer(modifier = Modifier.height(16.dp))
-
             content()
         }
     }
 }
-
 /**
  * Material 3 Log file item with export button
  * Matches Flutter _buildLogFileItem
@@ -2395,7 +2222,6 @@ private fun LogFileItem(
     onExport: () -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
@@ -2415,9 +2241,7 @@ private fun LogFileItem(
                 tint = colorScheme.primary,
                 modifier = Modifier.size(24.dp),
             )
-
             Spacer(modifier = Modifier.width(12.dp))
-
             // File info
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -2438,7 +2262,6 @@ private fun LogFileItem(
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
             }
-
             // Export button - Matches Flutter save_alt icon
             // Disabled during active export to prevent race conditions
             IconButton(
@@ -2452,7 +2275,6 @@ private fun LogFileItem(
                     modifier = Modifier.size(24.dp),
                 )
             }
-
             // Delete button
             IconButton(onClick = onDelete) {
                 Icon(
@@ -2465,7 +2287,6 @@ private fun LogFileItem(
         }
     }
 }
-
 /**
  * File Logging Status Row - for embedded status display
  * Matches Flutter _buildStatusRow exactly
@@ -2476,7 +2297,6 @@ private fun FileLoggingStatusRow(
     value: String,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-
     Row(
         modifier =
             Modifier
@@ -2498,16 +2318,48 @@ private fun FileLoggingStatusRow(
         )
     }
 }
+@Composable
+private fun ButtonContent(
+    isProcessing: Boolean,
+    icon: ImageVector,
+    label: String,
+    contentColor: Color,
+) {
+    AnimatedContent(
+        targetState = isProcessing,
+        transitionSpec = { (fadeIn() + scaleIn()).togetherWith(fadeOut() + scaleOut()) },
+        label = "iconTransition",
+    ) { processing ->
+        if (processing) {
+            LoadingSpinner(size = 24.dp, color = contentColor)
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                modifier = Modifier.size(24.dp),
+                tint = contentColor,
+            )
+        }
+    }
+
+    Spacer(modifier = Modifier.width(8.dp))
+
+    Text(
+        text = label,
+        style = MaterialTheme.typography.titleMedium,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        color = contentColor,
+    )
+}
 
 // ==================== UTILITY FUNCTIONS ====================
-
 private fun formatBytes(bytes: Long): String =
     when {
         bytes >= 1024 * 1024 -> String.format(Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0))
         bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
         else -> "$bytes B"
     }
-
 private fun formatFileSize(bytes: Long): String {
     val kb = bytes / 1024.0
     return "${String.format(Locale.US, "%.1f", kb)} KB"

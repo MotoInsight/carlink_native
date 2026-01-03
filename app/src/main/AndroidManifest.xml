@@ -36,6 +36,7 @@
         android:required="false" />
 
     <application
+        android:appCategory="audio"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -86,6 +87,10 @@
             <meta-data
                 android:name="distractionOptimized"
                 android:value="true" />
+            
+            <meta-data
+                android:name="com.android.automotive"
+                android:resource="@xml/automotive_app_desc" />  
         </activity>
 
         <!-- MediaBrowserService for AAOS Integration -->
