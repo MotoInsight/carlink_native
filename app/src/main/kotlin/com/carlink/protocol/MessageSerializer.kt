@@ -428,10 +428,8 @@ oemIconLabel = ${config.boxName}
         val audioTransferCommand = if (config.audioTransferMode) CommandMapping.AUDIO_TRANSFER_ON else CommandMapping.AUDIO_TRANSFER_OFF
         messages.add(serializeCommand(audioTransferCommand))
 
-        // Android work mode (if enabled)
-        if (config.androidWorkMode) {
-            messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
-        }
+        // ALWAYS enable AndroidWorkMode
+        messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
     }
 
     /**
