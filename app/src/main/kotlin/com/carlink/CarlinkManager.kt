@@ -714,26 +714,47 @@ class CarlinkManager(
      * After pauseVideo(), the codec is in a flushed state. This method restarts the
      * codec and requests a keyframe so video can resume immediately.
      *
-     * NOTE: The main surface update happens in initialize() when the new Surface is created.
-     * If onStart() is called before the Surface is ready, we skip resume here and let
-     * initialize() handle it when the Surface becomes available.
+     * Enhanced: Always request keyframe (even if surface not ready yet).
+     *           Send a second keyframe after short delay for reliability.
+     *           Add detailed logging for debugging.
      *
      * Call this from Activity.onStart().
      */
     fun resumeVideo() {
         logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
+
         val surface = videoSurface
-        if (surface == null || !surface.isValid) {
+        val surfaceValid = surface != null && surface.isValid
+
+        if (!surfaceValid) {
             logInfo(
-                "[LIFECYCLE] Surface not ready yet - resume will happen via initialize()",
+                "[LIFECYCLE] Surface not ready or invalid - deferring full resume to initialize()",
                 tag = Logger.Tags.VIDEO,
             )
+            // Still proactively request keyframe - helps when surface comes back quickly
+            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[RESUME] Early keyframe request sent (surface invalid): $sent", tag = Logger.Tags.VIDEO)
+            }
             return
         }
-        // Use no-arg resume()
+
+        logInfo("[RESUME] Surface valid - resuming renderer", tag = Logger.Tags.VIDEO)
         h264Renderer?.resume()
+
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
+            // Immediate keyframe request
+            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[RESUME] First keyframe request sent: $sent1", tag = Logger.Tags.VIDEO)
+
+            // Safety net: second request after 600ms (covers slow phone resume)
+            scope.launch {
+                delay(600)
+                if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[RESUME] Delayed second keyframe request sent: $sent2", tag = Logger.Tags.VIDEO)
+                }
+            }
         }
     }
     // ==================== Private Methods ====================
