@@ -67,6 +67,8 @@ class CarlinkManager(
 ) {
     // Config can be updated when actual surface dimensions are known
     private var config: AdapterConfig = initialConfig
+    private var lastSurfaceRebindMs = 0L
+    private var pendingStartUntilSurface = false
 
     companion object {
         private const val USB_WAIT_PERIOD_MS = 3000L
@@ -242,48 +244,42 @@ class CarlinkManager(
             config = config.copy(width = evenWidth, height = evenHeight)
         }
 
-        // LIFECYCLE FIX: If renderer exists, always update surface via setOutputSurface().
+        // LIFECYCLE FIX: If a renderer already exists, ALWAYS rebind the output surface immediately
+        // via MediaCodec.setOutputSurface() (invoked internally by resume()).
         //
-        // CRITICAL: Do NOT use reference equality (===) to check if Surface is "the same".
-        // After app goes to background, the Surface Java object may be the same reference,
-        // but the underlying native BufferQueue is DESTROYED and recreated.
-        // The codec will be rendering to a dead buffer → "BufferQueue has been abandoned" error.
+        // CRITICAL: Do NOT use reference equality (===) to determine whether a Surface is "the same".
+        // After the app is backgrounded or the system enters standby, the Java Surface object may
+        // appear unchanged, but the underlying native BufferQueue is DESTROYED and recreated.
+        // If the codec continues rendering to the old buffer, video output will stall or go black
+        // ("BufferQueue has been abandoned").
         //
-        // Solution: Always call setOutputSurface() when initialize() is called with an existing
-        // renderer. This ensures the codec always has a valid native surface.
+        // Correct behavior: Whenever initialize() is called with an existing renderer, immediately
+        // rebind the codec to the provided Surface. This guarantees the codec always renders to a
+        // valid native surface after pause/resume, standby, orientation changes, or surface recreation.
         // See: https://developer.android.com/reference/android/media/MediaCodec#setOutputSurface
         //
-        // DEBOUNCE FIX: Surface size changes rapidly during layout (996→960→965→969→992).
-        // Each change triggers codec recreation. Debounce to wait for size stabilization.
+        // NOTE ON RAPID SIZE CHANGES:
+        // During initial layout or UI transitions, the surface size may change rapidly
+        // (e.g., 996→960→965→969→992). To avoid excessive repeated rebind calls during this brief
+        // jitter window, a small throttle (e.g., ~120ms) may be applied around the resume()
+        // invocation.
+        //
+        // IMPORTANT:
+        // This is a THROTTLE, not a debounce. One immediate surface rebind must always occur.
+        // Surface rebinding is cheap and lifecycle-critical and MUST NOT be delayed, otherwise
+        // the codec may continue rendering into a destroyed BufferQueue, resulting in a black screen.
+
         if (h264Renderer != null) {
-            // Store pending values
-            pendingSurface = surface
-            pendingSurfaceWidth = evenWidth
-            pendingSurfaceHeight = evenHeight
-            pendingCallback = callback
-
-            // Cancel any pending update
             surfaceUpdateJob?.cancel()
+            this@CarlinkManager.callback = callback
+            this@CarlinkManager.videoSurface = surface
 
-            // Debounce: wait for surface size to stabilize before updating codec
-            surfaceUpdateJob =
-                scope.launch {
-                    delay(SURFACE_DEBOUNCE_MS)
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastSurfaceRebindMs >= 120L) {
+                lastSurfaceRebindMs = now
+                h264Renderer?.resume()
+            }
 
-                    // Use the latest pending values after debounce
-                    val finalSurface = pendingSurface ?: return@launch
-                    val finalCallback = pendingCallback ?: return@launch
-
-                    logInfo(
-                        "[LIFECYCLE] Surface stabilized at ${pendingSurfaceWidth}x$pendingSurfaceHeight - updating codec",
-                        tag = Logger.Tags.VIDEO,
-                    )
-
-                    this@CarlinkManager.callback = finalCallback
-                    this@CarlinkManager.videoSurface = finalSurface
-                    // Resume with new surface - this calls setOutputSurface() internally
-                    h264Renderer?.resume()
-                }
             return
         }
 
@@ -338,6 +334,34 @@ class CarlinkManager(
 
         // Mark video as initialized - videoProcessor will now process frames instead of discarding
         videoInitialized = true
+        
+        // If something requested start() before the surface existed, start now.
+        if (pendingStartUntilSurface) {
+            pendingStartUntilSurface = false
+            scope.launch {
+                delay(150) // small settle time for Surface/codec
+                try {
+                    start()
+                } catch (e: Exception) {
+                    logError("[START] Deferred start failed: ${e.message}", tag = Logger.Tags.USB)
+                }
+            }
+        }
+
+        // If we are already connected/streaming, request a keyframe now that decoder is ready.
+        if (state == State.DEVICE_CONNECTED || state == State.STREAMING) {
+            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[INIT] Keyframe request after initialize sent: $sent1", tag = Logger.Tags.VIDEO)
+
+            scope.launch {
+                delay(600)
+                if (state == State.DEVICE_CONNECTED || state == State.STREAMING) {
+                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[INIT] Second keyframe request after initialize sent: $sent2", tag = Logger.Tags.VIDEO)
+                }
+            }
+        }
+        
         logInfo("Video subsystem initialized and ready for decoding", tag = Logger.Tags.VIDEO)
 
         // Initialize audio manager with platform-specific config
@@ -399,16 +423,17 @@ class CarlinkManager(
      * Start connection to the adapter.
      */
     suspend fun start() {
-        // Guard: Ensure H264Renderer is initialized before starting connection
-        // This prevents video data from being discarded when app starts via MediaBrowserService
-        // before MainActivity/Surface is ready
+        // Hard guard: do not start streaming until the renderer exists.
+        // Starting early can discard SPS/PPS + first IDR and lead to a persistent black screen.
         if (h264Renderer == null) {
             logWarn(
-                "H264Renderer not initialized - Surface not ready. " +
-                    "Video will be discarded until initialize() is called with valid Surface.",
+                "[START] Renderer not initialized (Surface not ready). Deferring start until initialize() runs.",
                 tag = Logger.Tags.VIDEO,
             )
+            pendingStartUntilSurface = true
+            return
         }
+        pendingStartUntilSurface = false
 
         setState(State.CONNECTING)
 
@@ -682,6 +707,9 @@ class CarlinkManager(
 
         // Clear surface reference - it's now invalid
         videoSurface = null
+        
+        // Ensure that next initialize always passes throttling 
+        lastSurfaceRebindMs = 0L
 
         // Pause codec immediately to prevent rendering to dead surface
         h264Renderer?.pause()
@@ -838,7 +866,10 @@ class CarlinkManager(
     private fun handleMessage(message: Message) {
         when (message) {
             is PluggedMessage -> {
-                logInfo("[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}", tag = Logger.Tags.VIDEO)
+                logInfo(
+                    "[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}",
+                    tag = Logger.Tags.VIDEO
+                )
                 clearPairTimeout()
                 stopFrameInterval() // Stop any existing timer (clean slate)
 
@@ -849,9 +880,26 @@ class CarlinkManager(
                 currentPhoneType = message.phoneType
                 logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType", tag = Logger.Tags.VIDEO)
 
-                // Start frame interval for CarPlay
-                // This periodic keyframe request keeps video streaming stable
-                // Protocol specifies FRAME command every 5 seconds during session
+                // AUTO-FIX: After vehicle sleep/wake, decoder can be stuck black until manual reset.
+                // Do exactly what the UI button does.
+                resetVideoDecoder()
+
+                // IMPORTANT: ensureFrameIntervalRunning() only sends FRAME every 5s.
+                // Send an immediate keyframe request now that decoder is reset.
+                scope.launch {
+                    delay(200)
+                    val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[PLUGGED] Keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
+
+                    // Safety net: second request helps slow phone/adapter resumes
+                    delay(600)
+                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[PLUGGED] Second keyframe request after reset sent: $sent2", tag = Logger.Tags.VIDEO)
+                }
+
+                // Start frame interval for CarPlay (periodic keyframe requests)
+                // NOTE: resetVideoDecoder() already calls ensureFrameIntervalRunning(),
+                // but calling again is safe (it no-ops if already running).
                 ensureFrameIntervalRunning()
 
                 setState(State.DEVICE_CONNECTED)
