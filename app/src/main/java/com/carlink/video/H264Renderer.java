@@ -581,6 +581,24 @@ public class H264Renderer {
     }
 
   /**
+   * Clears the ring buffer and available codec input indexes defensively.
+   *
+   * Called during resume when previously paused to ensure no stale packets remain,
+   * preventing backlog or race conditions after standby/suspend. Thread-safe with codecLock.
+   */
+  public void clearRingBuffer() {
+      synchronized (codecLock) {
+          if (ringBuffer != null) {
+              ringBuffer.reset();
+          }
+          synchronized (codecAvailableBufferIndexes) {
+              codecAvailableBufferIndexes.clear();
+          }
+          log("[LIFECYCLE] Cleared ring buffer defensively");
+      }
+  }
+
+  /**
    * Updates the output surface for the decoder without recreating the codec.
    *
    * Important for lifecycle: the Java Surface reference may look the same, but the

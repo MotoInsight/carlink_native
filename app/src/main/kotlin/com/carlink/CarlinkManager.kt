@@ -69,6 +69,20 @@ class CarlinkManager(
     private var config: AdapterConfig = initialConfig
     private var lastSurfaceRebindMs = 0L
     private var pendingStartUntilSurface = false
+    private var videoPaused = false
+
+    // When true, perform a one-time decoder recovery the next time streaming starts.
+    private var needsPostStreamRecovery = false
+
+    // Prevent multiple recoveries in the same streaming session.
+    private var didPostStreamRecovery = false
+
+    // Guard against immediate double-reset (e.g., reset in start() then reset again on first STREAMING)
+    private var lastDecoderResetMs = 0L
+    
+    // Reusable discard buffer for paused video (prevents GC churn)
+    // 256KB reduces loop iterations on large packets without being "huge"
+    private var discardVideoBuffer: ByteArray = ByteArray(256 * 1024)
 
     companion object {
         private const val USB_WAIT_PERIOD_MS = 3000L
@@ -260,7 +274,7 @@ class CarlinkManager(
         //
         // NOTE ON RAPID SIZE CHANGES:
         // During initial layout or UI transitions, the surface size may change rapidly
-        // (e.g., 996→960→965→969→992). To avoid excessive repeated rebind calls during this brief
+        // (e.g., 996->960->965->969->992). To avoid excessive repeated rebind calls during this brief
         // jitter window, a small throttle (e.g., ~120ms) may be applied around the resume()
         // invocation.
         //
@@ -274,15 +288,18 @@ class CarlinkManager(
             this@CarlinkManager.callback = callback
             this@CarlinkManager.videoSurface = surface
 
+            // Unblock gate BEFORE rebind/resume (critical to accept first keyframe packets)
+            videoPaused = false
+
             val now = android.os.SystemClock.uptimeMillis()
             if (now - lastSurfaceRebindMs >= 120L) {
                 lastSurfaceRebindMs = now
+                h264Renderer?.setOutputSurface(surface)
                 h264Renderer?.resume()
             }
-
             return
         }
-
+        
         // First-time initialization - create new renderer
         this.callback = callback
         this.videoSurface = surface
@@ -333,8 +350,9 @@ class CarlinkManager(
         h264Renderer?.start()
 
         // Mark video as initialized - videoProcessor will now process frames instead of discarding
+        videoPaused = false
         videoInitialized = true
-        
+
         // If something requested start() before the surface existed, start now.
         if (pendingStartUntilSurface) {
             pendingStartUntilSurface = false
@@ -361,7 +379,7 @@ class CarlinkManager(
                 }
             }
         }
-        
+
         logInfo("Video subsystem initialized and ready for decoding", tag = Logger.Tags.VIDEO)
 
         // Initialize audio manager with platform-specific config
@@ -379,7 +397,7 @@ class CarlinkManager(
             )
 
         // Initialize MediaSession only for ADAPTER audio mode (not Bluetooth)
-        // In Bluetooth mode, audio goes through phone BT → car stereo directly,
+        // In Bluetooth mode, audio goes through phone BT -> car stereo directly,
         // so we don't want this app to appear as an active media source in AAOS.
         // This prevents the vehicle from switching audio source to the app when
         // the user opens or returns to it.
@@ -435,6 +453,10 @@ class CarlinkManager(
         }
         pendingStartUntilSurface = false
 
+        // New session attempt (often after vehicle sleep). Arm a one-time post-stream recovery.
+        needsPostStreamRecovery = true
+        didPostStreamRecovery = false
+
         setState(State.CONNECTING)
 
         // Stop any existing connection
@@ -444,6 +466,7 @@ class CarlinkManager(
 
         // Reset video renderer (only if initialized)
         h264Renderer?.reset()
+        lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
 
         // Initialize audio
         if (!audioInitialized) {
@@ -519,6 +542,7 @@ class CarlinkManager(
 
         // Mark first init completed and clear pending changes after successful start
         // This runs in a coroutine to handle the suspend functions
+        videoPaused = false
         CoroutineScope(Dispatchers.IO).launch {
             if (initMode == AdapterConfigPreference.InitMode.FULL) {
                 adapterConfigPref.markFirstInitCompleted()
@@ -548,6 +572,7 @@ class CarlinkManager(
      */
     fun stop() {
         logDebug("[LIFECYCLE] stop() called - clearing frame interval and phoneType", tag = Logger.Tags.VIDEO)
+        didPostStreamRecovery = false
         clearPairTimeout()
         stopFrameInterval()
         cancelReconnect() // Cancel any pending auto-reconnect
@@ -601,7 +626,8 @@ class CarlinkManager(
     /**
      * Send a multi-touch event.
      */
-    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean = adapterDriver?.sendMultiTouch(touches) ?: false
+    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean =
+        adapterDriver?.sendMultiTouch(touches) ?: false
 
     /**
      * Release all resources.
@@ -665,6 +691,7 @@ class CarlinkManager(
     fun resetVideoDecoder() {
         logInfo("[DEVICE_OPS] Resetting H264 video decoder", tag = Logger.Tags.VIDEO)
         h264Renderer?.reset()
+        lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
         logInfo("[DEVICE_OPS] H264 video decoder reset completed", tag = Logger.Tags.VIDEO)
         // Ensure frame interval running after manual reset
         ensureFrameIntervalRunning()
@@ -707,19 +734,20 @@ class CarlinkManager(
 
         // Clear surface reference - it's now invalid
         videoSurface = null
-        
-        // Ensure that next initialize always passes throttling 
+
+        // Ensure that next initialize always passes throttling
         lastSurfaceRebindMs = 0L
 
         // Pause codec immediately to prevent rendering to dead surface
         h264Renderer?.pause()
+        videoPaused = true
     }
 
     /**
      * Pause video decoding when app goes to background.
      *
      * On AAOS, when the app is covered by another app (e.g., Maps, Phone), the Surface
-     * may remain valid but SurfaceFlinger stops consuming frames. This causes the
+     * may remain valid but SurfaceFlinger stops consuming frames. This causes
      * BufferQueue to fill up, stalling the decoder. When the user returns, video
      * appears blank while audio continues normally.
      *
@@ -731,60 +759,63 @@ class CarlinkManager(
      *
      * Call this from Activity.onStop().
      */
-    fun pauseVideo() {
-        logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
-        h264Renderer?.pause()
-    }
-
-    /**
-     * Resume video decoding when app returns to foreground.
-     *
-     * After pauseVideo(), the codec is in a flushed state. This method restarts the
-     * codec and requests a keyframe so video can resume immediately.
-     *
-     * Enhanced: Always request keyframe (even if surface not ready yet).
-     *           Send a second keyframe after short delay for reliability.
-     *           Add detailed logging for debugging.
-     *
-     * Call this from Activity.onStart().
-     */
-    fun resumeVideo() {
-        logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
-
-        val surface = videoSurface
-        val surfaceValid = surface != null && surface.isValid
-
-        if (!surfaceValid) {
-            logInfo(
-                "[LIFECYCLE] Surface not ready or invalid - deferring full resume to initialize()",
-                tag = Logger.Tags.VIDEO,
-            )
-            // Still proactively request keyframe - helps when surface comes back quickly
-            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                logInfo("[RESUME] Early keyframe request sent (surface invalid): $sent", tag = Logger.Tags.VIDEO)
-            }
-            return
+        fun pauseVideo() {
+            logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
+            h264Renderer?.pause()
+            videoPaused = true
         }
 
-        logInfo("[RESUME] Surface valid - resuming renderer", tag = Logger.Tags.VIDEO)
-        h264Renderer?.resume()
+    /**
+     * Resumes video decoding when the app returns to the foreground.
+     *
+     * Re-binds the output surface (critical after standby/suspend where native BufferQueue may be recreated),
+     * conditionally restarts the codec only if previously paused/flushed, clears any potential backlog defensively,
+     * and requests keyframes (immediate + delayed) to accelerate recovery and prevent black/grey screens.
+     *
+     * Call this from Activity.onStart() for proper lifecycle symmetry.
+     */
+        fun resumeVideo() {
+            logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
 
-        if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            // Immediate keyframe request
-            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-            logInfo("[RESUME] First keyframe request sent: $sent1", tag = Logger.Tags.VIDEO)
+            val surface = videoSurface
+            val surfaceValid = surface != null && surface.isValid
 
-            // Safety net: second request after 600ms (covers slow phone resume)
-            scope.launch {
-                delay(600)
+            if (!surfaceValid) {
+                logInfo("[LIFECYCLE] Surface not ready or invalid - deferring full resume to initialize()", tag = Logger.Tags.VIDEO)
                 if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                    logInfo("[RESUME] Delayed second keyframe request sent: $sent2", tag = Logger.Tags.VIDEO)
+                    val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[RESUME] Early keyframe request sent (surface invalid): $sent", tag = Logger.Tags.VIDEO)
+                }
+                return
+            }
+
+            // Always rebind surface first
+            h264Renderer?.setOutputSurface(surface)
+
+            // Conditional resume + defensive clear
+            if (videoPaused) {
+                h264Renderer?.clearRingBuffer() // optional defensive
+                h264Renderer?.resume()
+                videoPaused = false  // Only clear after actual resume
+            } else {
+                logInfo("[RESUME] Not paused - skipping codec.start()", tag = Logger.Tags.VIDEO)
+            }
+
+            // Double keyframe request
+            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[RESUME] First keyframe request sent: $sent1", tag = Logger.Tags.VIDEO)
+
+                scope.launch {
+                    delay(600)
+                    if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                        val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                        logInfo("[RESUME] Delayed second keyframe request sent: $sent2", tag = Logger.Tags.VIDEO)
+                    }
                 }
             }
         }
-    }
+
     // ==================== Private Methods ====================
 
     private fun setState(newState: State) {
@@ -863,12 +894,49 @@ class CarlinkManager(
         return device
     }
 
+    private fun maybeRunPostStreamRecovery() {
+        if (!needsPostStreamRecovery || didPostStreamRecovery) return
+
+        // Avoid immediate double-reset (e.g., start() already reset the decoder moments ago)
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastDecoderResetMs < 1500L) {
+            logInfo("[RECOVERY] Skipping post-stream reset - decoder was reset recently", tag = Logger.Tags.VIDEO)
+            didPostStreamRecovery = true
+            needsPostStreamRecovery = false
+            return
+        }
+
+        didPostStreamRecovery = true
+        needsPostStreamRecovery = false
+
+        logWarn(
+            "[RECOVERY] Streaming started after reconnect - scheduling one-time decoder reset + keyframe",
+            tag = Logger.Tags.VIDEO,
+        )
+
+        scope.launch {
+            // Let the stream settle briefly before resetting (more reliable than resetting on Plugged)
+            delay(400)
+
+            resetVideoDecoder()
+            h264Renderer?.resume()
+
+            delay(200)
+            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[RECOVERY] Keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
+
+            delay(600)
+            val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[RECOVERY] Second keyframe request after reset sent: $sent2", tag = Logger.Tags.VIDEO)
+        }
+    }
+
     private fun handleMessage(message: Message) {
         when (message) {
             is PluggedMessage -> {
                 logInfo(
                     "[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}",
-                    tag = Logger.Tags.VIDEO
+                    tag = Logger.Tags.VIDEO,
                 )
                 clearPairTimeout()
                 stopFrameInterval() // Stop any existing timer (clean slate)
@@ -880,26 +948,16 @@ class CarlinkManager(
                 currentPhoneType = message.phoneType
                 logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType", tag = Logger.Tags.VIDEO)
 
-                // AUTO-FIX: After vehicle sleep/wake, decoder can be stuck black until manual reset.
-                // Do exactly what the UI button does.
-                resetVideoDecoder()
-
-                // IMPORTANT: ensureFrameIntervalRunning() only sends FRAME every 5s.
-                // Send an immediate keyframe request now that decoder is reset.
-                scope.launch {
-                    delay(200)
-                    val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                    logInfo("[PLUGGED] Keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
-
-                    // Safety net: second request helps slow phone/adapter resumes
-                    delay(600)
-                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                    logInfo("[PLUGGED] Second keyframe request after reset sent: $sent2", tag = Logger.Tags.VIDEO)
+                // Plugged means a new session is forming. Don't reset yet; do recovery when streaming starts.
+                // If we are already streaming, do not re-arm recovery (avoid resetting a good stream).
+                if (state != State.STREAMING) {
+                    needsPostStreamRecovery = true
+                    didPostStreamRecovery = false
+                } else {
+                    logDebug("[PLUGGED] Already streaming - skipping post-stream recovery arm", tag = Logger.Tags.VIDEO)
                 }
 
-                // Start frame interval for CarPlay (periodic keyframe requests)
-                // NOTE: resetVideoDecoder() already calls ensureFrameIntervalRunning(),
-                // but calling again is safe (it no-ops if already running).
+                // Start/ensure frame interval for CarPlay (periodic keyframe requests)
                 ensureFrameIntervalRunning()
 
                 setState(State.DEVICE_CONNECTED)
@@ -921,6 +979,8 @@ class CarlinkManager(
                     ensureFrameIntervalRunning()
                 }
 
+                maybeRunPostStreamRecovery()
+
                 // Feed video data to renderer (fallback when direct processing not used)
                 message.data?.let { data ->
                     h264Renderer?.processData(data, message.flags)
@@ -938,6 +998,9 @@ class CarlinkManager(
                     // Safety net: ensure frame interval running when video starts
                     ensureFrameIntervalRunning()
                 }
+
+                maybeRunPostStreamRecovery()
+
                 // Video data already processed directly into ring buffer by videoProcessor
             }
 
@@ -972,7 +1035,7 @@ class CarlinkManager(
 
     private fun processAudioData(message: AudioDataMessage) {
         // Handle volume ducking
-        message.volumeDuration?.let { duration ->
+        message.volumeDuration?.let { _ ->
             audioManager?.setDucking(message.volume?.toFloat() ?: 1.0f)
             return
         }
@@ -1349,6 +1412,7 @@ class CarlinkManager(
             // Reset video renderer using manager
             try {
                 h264Renderer?.reset()
+                lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
                 logInfo("[EMERGENCY CLEANUP] Video renderer reset", tag = Logger.Tags.ADAPTR)
             } catch (e: Exception) {
                 logError("[EMERGENCY CLEANUP] Video reset error: ${e.message}", tag = Logger.Tags.ADAPTR)
@@ -1439,47 +1503,45 @@ class CarlinkManager(
      * The processor reads USB data directly into the H264Renderer's ring buffer,
      * skipping the 20-byte video header (width, height, flags, length, unknown).
      */
-    private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
-        return object : UsbDeviceWrapper.VideoDataProcessor {
-            override fun processVideoDirect(
-                payloadLength: Int,
-                readCallback: (buffer: ByteArray, offset: Int, length: Int) -> Int,
-            ) {
-                // Get the H264Renderer - if not available, discard data
-                val renderer =
-                    h264Renderer ?: run {
-                        // Still need to read and discard the data to prevent USB buffer overflow
-                        val discardBuffer = ByteArray(payloadLength)
-                        readCallback(discardBuffer, 0, payloadLength)
+        private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
+            return object : UsbDeviceWrapper.VideoDataProcessor {
+                override fun processVideoDirect(
+                    payloadLength: Int,
+                    readCallback: (buffer: ByteArray, offset: Int, length: Int) -> Int,
+                ) {
+                    // Gate: Drop video while paused or renderer missing
+                    if (videoPaused || h264Renderer == null) {
+                        var remaining = payloadLength
+                        while (remaining > 0) {
+                            val toRead = minOf(remaining, discardVideoBuffer.size)
+                            val bytesRead = readCallback(discardVideoBuffer, 0, toRead)
+                            if (bytesRead <= 0) {
+                                logWarn("[VIDEO_GATE] Partial USB read during discard - may stall endpoint", tag = Logger.Tags.VIDEO)
+                                break
+                            }
+                            remaining -= bytesRead
+                        }
 
-                        // Log warning (throttled to every 2 seconds to avoid log spam)
-                        val now = System.currentTimeMillis()
-                        if (now - lastVideoDiscardWarningTime > 2000) {
+                        val now = android.os.SystemClock.uptimeMillis()
+                        if (now - lastVideoDiscardWarningTime > 5000) {
                             lastVideoDiscardWarningTime = now
-                            logWarn(
-                                "Video frame discarded - H264Renderer not initialized. " +
-                                    "Ensure initialize(surface) is called before video streaming starts.",
-                                tag = Logger.Tags.VIDEO,
-                            )
+                            logInfo("[VIDEO_GATE] Dropped video packet while paused (size=$payloadLength)", tag = Logger.Tags.VIDEO)
                         }
                         return
                     }
 
-                // Use processDataDirect to write directly to ring buffer
-                // payloadLength includes the 20-byte video header
-                // skipBytes=20 tells the ring buffer to skip the header when reading
-                logVideoUsb { "processVideoDirect: payloadLength=$payloadLength" }
-
-                renderer.processDataDirect(payloadLength, 20) { buffer, offset ->
-                    // Read USB data directly into the ring buffer
-                    readCallback(buffer, offset, payloadLength)
+                    // Normal processing
+                    logVideoUsb { "processVideoDirect: payloadLength=$payloadLength" }
+                    h264Renderer?.processDataDirect(payloadLength, 20) { buffer, offset ->
+                        readCallback(buffer, offset, payloadLength)
+                    }
                 }
             }
         }
-    }
 
     private fun log(message: String) {
         logDebug(message, tag = Logger.Tags.ADAPTR)
         callback?.onLogMessage(message)
     }
 }
+
