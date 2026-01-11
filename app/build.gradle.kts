@@ -12,7 +12,7 @@ android {
         applicationId = "com.werksmangm.cpaaplayer"
         minSdk = 32
         targetSdk = 36
-        versionCode = 60
+        versionCode = 61
         versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

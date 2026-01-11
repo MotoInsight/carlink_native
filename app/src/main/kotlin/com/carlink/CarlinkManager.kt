@@ -823,6 +823,11 @@ class CarlinkManager(
         if (oldState != newState) {
             callback?.onStateChanged(newState)
             updateMediaSessionState(newState)
+
+            if (newState == State.STREAMING) {
+                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[STATE] Immediate keyframe request on STREAMING state: $sent", tag = Logger.Tags.VIDEO)
+            }
         }
     }
 
@@ -897,7 +902,7 @@ class CarlinkManager(
     private fun maybeRunPostStreamRecovery() {
         if (!needsPostStreamRecovery || didPostStreamRecovery) return
 
-        // Avoid immediate double-reset (e.g., start() already reset the decoder moments ago)
+        // Avoid immediate double-reset
         val now = android.os.SystemClock.uptimeMillis()
         if (now - lastDecoderResetMs < 1500L) {
             logInfo("[RECOVERY] Skipping post-stream reset - decoder was reset recently", tag = Logger.Tags.VIDEO)
@@ -910,20 +915,19 @@ class CarlinkManager(
         needsPostStreamRecovery = false
 
         logWarn(
-            "[RECOVERY] Streaming started after reconnect - scheduling one-time decoder reset + keyframe",
+            "[RECOVERY] Streaming started after reconnect - scheduling one-time decoder reset + keyframe burst",
             tag = Logger.Tags.VIDEO,
         )
 
         scope.launch {
-            // Let the stream settle briefly before resetting (more reliable than resetting on Plugged)
-            delay(400)
+            // Delay past MIN_STARTUP_TIME_MS (2000ms) so reset() actually executes
+            delay(2500)
 
-            resetVideoDecoder()
-            h264Renderer?.resume()
+            resetVideoDecoder()  // Flush + start + keyframe request
 
             delay(200)
             val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-            logInfo("[RECOVERY] Keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
+            logInfo("[RECOVERY] First keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
 
             delay(600)
             val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
@@ -1018,6 +1022,8 @@ class CarlinkManager(
                 if (message.command == CommandMapping.REQUEST_HOST_UI) {
                     callback?.onHostUIPressed()
                 } else if (message.command == CommandMapping.PROJECTION_DISCONNECTED) {
+                    needsPostStreamRecovery = true
+                    didPostStreamRecovery = false
                     scope.launch {
                         restart()
                     }
