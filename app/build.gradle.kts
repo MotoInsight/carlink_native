@@ -9,11 +9,11 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.werksmangm.cpaaplayer"
+        applicationId = "com.mrphelps.carlinknative"
         minSdk = 32
-        targetSdk = 36
+        targetSdk = 52
         versionCode = 61
-        versionName = "1.1"
+        versionName = "1.0.52"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
