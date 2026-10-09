@@ -1,70 +1,67 @@
 package com.carlink.audio
 
+import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
-import android.util.Log
-import com.carlink.BuildConfig
 import com.carlink.platform.AudioConfig
-import com.carlink.util.AudioDebugLogger
+import com.carlink.protocol.AudioRoutingState
+import com.carlink.protocol.StreamPurpose
 import com.carlink.util.LogCallback
 import java.util.concurrent.atomic.AtomicBoolean
-
-private const val TAG = "CARLINK_AUDIO"
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Audio stream type identifiers from CPC200-CCPA protocol.
  */
 object AudioStreamType {
-    const val MEDIA = 1 // Music, podcasts, etc.
+    const val MEDIA = 1 // Music, podcasts, Siri, phone, alerts (all non-nav)
     const val NAVIGATION = 2 // Turn-by-turn directions
-    const val PHONE_CALL = 3 // Phone calls (exclusive)
-    const val SIRI = 4 // Voice assistant (exclusive)
+    // Note: Protocol defines PHONE_CALL=3 and SIRI=4, but adapter always sends type=1.
+    // Routing is handled via AudioRoutingState flags + format matching instead.
 }
 
 /**
- * DualStreamAudioManager - Handles multiple audio streams with AAOS CarAudioContext integration.
+ * DualStreamAudioManager - Pre-allocated per-purpose audio streams.
  *
  * PURPOSE:
  * Provides stable, uninterrupted audio playback for CarPlay/Android Auto projection
- * by using separate AudioTracks for each stream type, with ring buffers to absorb
- * USB packet jitter. Each stream uses the appropriate USAGE constant for proper
- * AAOS routing to CarAudioContext.
+ * using dedicated pre-allocated AudioTracks per stream purpose (Media, Siri, PhoneCall,
+ * Alert, Navigation), with ring buffers to absorb USB packet jitter.
  *
  * ARCHITECTURE:
+ * Ring-buffer capacities are platform-dependent ([AudioConfig.mediaBufferCapacityMs] /
+ * [AudioConfig.navBufferCapacityMs]); the values shown are typical defaults.
  * ```
  * USB Thread (non-blocking)
  *     │
- *     ├──► Media Ring Buffer (250ms) ──► Media AudioTrack
- *     │                                    (USAGE_MEDIA → CarAudioContext.MUSIC)
- *     │
- *     ├──► Nav Ring Buffer (120ms) ──► Nav AudioTrack
- *     │                                  (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → CarAudioContext.NAVIGATION)
- *     │
- *     ├──► Voice Ring Buffer (150ms) ──► Voice AudioTrack
- *     │                                    (USAGE_ASSISTANT → CarAudioContext.VOICE_COMMAND)
- *     │
- *     └──► Call Ring Buffer (150ms) ──► Call AudioTrack
- *                                         (USAGE_VOICE_COMMUNICATION → CarAudioContext.CALL)
+ *     ├──► Media Ring Buffer (~500ms) ──► Media AudioTrack (USAGE_MEDIA)
+ *     ├──► Siri Ring Buffer  (~500ms) ──► Siri AudioTrack (USAGE_ASSISTANT)
+ *     ├──► Call Ring Buffer  (~500ms) ──► Call AudioTrack (USAGE_VOICE_COMMUNICATION)
+ *     ├──► Alert Ring Buffer (~500ms) ──► Alert AudioTrack (USAGE_VOICE_COMMUNICATION_SIGNALLING)
+ *     └──► Nav Ring Buffer   (~200ms) ──► Nav AudioTrack (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
  *     │
  *     └──► Playback Thread (THREAD_PRIORITY_URGENT_AUDIO)
  *             reads from all buffers, writes to AudioTracks
  * ```
+ * ALERT uses USAGE_VOICE_COMMUNICATION_SIGNALLING (not USAGE_NOTIFICATION_RINGTONE) as
+ * a deliberate workaround for GM AAOS bus routing — see [purposeToAttributes].
  *
- * AAOS CarAudioContext Mapping:
- * - USAGE_MEDIA (1) → MUSIC context
- * - USAGE_ASSISTANCE_NAVIGATION_GUIDANCE (12) → NAVIGATION context
- * - USAGE_ASSISTANT (16) → VOICE_COMMAND context
- * - USAGE_VOICE_COMMUNICATION (2) → CALL context
- *
- * KEY FEATURES:
- * - Lock-free ring buffers absorb 500-1200ms packet gaps from adapter
- * - Non-blocking writes from USB thread
- * - Dedicated high-priority playback thread
- * - Independent volume control per stream (ducking support)
- * - Automatic format switching per stream
- * - Proper AAOS audio routing via CarAudioContext
+ * ROUTING:
+ * PCM packets are routed by two-factor matching: audio command state flags + format match.
+ * This prevents transition artifacts where media PCM briefly routes to the wrong AudioTrack
+ * when purpose changes (e.g., SIRI_START arrives but adapter still sends media PCM).
+ * - audioType=2 → Navigation
+ * - audioType=1 + isPhoneCallActive + mono @ 8kHz (AA HFP/SCO) or 16kHz (CarPlay iAP2) → PhoneCall track
+ * - audioType=1 + isSiriActive + 16kHz mono → Siri track
+ * - audioType=1 + isAlertActive → Alert track (format-agnostic; ensureSlotFormat handles
+ *     48kHz/2ch CarPlay or 24kHz/1ch AA)
+ * - audioType=1 + anything else → Media track (default, catches transition-period packets)
  *
  * THREAD SAFETY:
  * - writeAudio() called from USB thread (non-blocking)
@@ -72,111 +69,151 @@ object AudioStreamType {
  * - Volume/ducking can be called from any thread
  */
 class DualStreamAudioManager(
+    private val context: Context,
     private val logCallback: LogCallback,
     private val audioConfig: AudioConfig = AudioConfig.DEFAULT,
 ) {
-    // Audio tracks for each stream type (maps to AAOS CarAudioContext)
-    private var mediaTrack: AudioTrack? = null // USAGE_MEDIA → MUSIC
-    private var navTrack: AudioTrack? = null // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION
-    private var voiceTrack: AudioTrack? = null // USAGE_ASSISTANT → VOICE_COMMAND
-    private var callTrack: AudioTrack? = null // USAGE_VOICE_COMMUNICATION → CALL
+    private val systemAudioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    // Ring buffers for jitter compensation (one per stream)
-    private var mediaBuffer: AudioRingBuffer? = null // 250ms for music
-    private var navBuffer: AudioRingBuffer? = null // 120ms for nav prompts
-    private var voiceBuffer: AudioRingBuffer? = null // 150ms for voice assistant
-    private var callBuffer: AudioRingBuffer? = null // 150ms for phone calls
+    // Pre-allocated per-purpose audio slots (created at init, one per stream purpose)
+    private var mediaSlot: PurposeSlot? = null
+    private var siriSlot: PurposeSlot? = null
+    private var phoneCallSlot: PurposeSlot? = null
+    private var alertSlot: PurposeSlot? = null
 
-    // Current audio format per stream
-    private var mediaFormat: AudioFormatConfig? = null
-    private var navFormat: AudioFormatConfig? = null
-    private var voiceFormat: AudioFormatConfig? = null
-    private var callFormat: AudioFormatConfig? = null
+    // Navigation: single track (format doesn't change mid-session)
+    @Volatile private var navTrack: AudioTrack? = null
 
-    // Volume control
+    @Volatile private var navBuffer: AudioRingBuffer? = null
+
+    @Volatile private var navFormat: AudioFormatConfig? = null
+
     private var mediaVolume: Float = 1.0f
     private var navVolume: Float = 1.0f
-    private var voiceVolume: Float = 1.0f
-    private var callVolume: Float = 1.0f
     private var isDucked: Boolean = false
-    private var duckLevel: Float = 0.2f // 20% volume when ducked
+    private var duckLevel: Float = 1.0f // 1.0 = no duck; adapter sets lower via volumeDuration packets
 
-    // Playback thread
+    // AudioFocus state machine
+    private val activeFocusRequests = mutableMapOf<StreamPurpose, AudioFocusRequest>()
+    private var focusDuckLevel: Float = 1.0f // system-driven duck (1.0 = none)
+
+    /** Per-purpose focus listeners — AAOS CarAudioFocus uses the listener as identity key.
+     *  A single listener cannot hold focus for two different usages simultaneously. */
+    private val focusListeners = mutableMapOf<StreamPurpose, AudioManager.OnAudioFocusChangeListener>()
+    private val focusHandler = Handler(Looper.getMainLooper())
+
+    private fun getOrCreateFocusListener(purpose: StreamPurpose): AudioManager.OnAudioFocusChangeListener =
+        focusListeners.getOrPut(purpose) {
+            AudioManager.OnAudioFocusChangeListener { focusChange ->
+                val changeStr =
+                    when (focusChange) {
+                        AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "LOSS_TRANSIENT_CAN_DUCK"
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "LOSS_TRANSIENT"
+                        AudioManager.AUDIOFOCUS_LOSS -> "LOSS"
+                        else -> "UNKNOWN($focusChange)"
+                    }
+                logDebug("[AUDIO_FOCUS] FocusChange($purpose): $changeStr")
+                // Only MEDIA adjusts volume on duck — other purposes are short-lived
+                // foreground streams that play at full volume.
+                if (purpose == StreamPurpose.MEDIA) {
+                    focusDuckLevel =
+                        when (focusChange) {
+                            AudioManager.AUDIOFOCUS_GAIN -> 1.0f
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> 0.2f
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> 0.0f
+                            AudioManager.AUDIOFOCUS_LOSS -> 0.0f
+                            else -> focusDuckLevel
+                        }
+                    applyEffectiveVolume()
+                }
+            }
+        }
+
     private var playbackThread: AudioPlaybackThread? = null
     private val isRunning = AtomicBoolean(false)
 
-    // Statistics
-    private var startTime: Long = 0
-    private var mediaUnderruns: Int = 0
     private var navUnderruns: Int = 0
-    private var voiceUnderruns: Int = 0
-    private var callUnderruns: Int = 0
-    private var writeCount: Long = 0 // DEBUG: Counter for periodic logging
-    private var lastStatsLog: Long = 0 // DEBUG: Timestamp of last stats log
-    private var zeroPacketsFiltered: Long = 0 // Count of zero-filled packets filtered
 
-    // Buffer size multiplier - platform-specific, from AudioConfig
-    // Default: 5x minimum for USB jitter tolerance
-    // GM AAOS: 8x minimum due to FAST track denial
+    // 30s aggregate stats counters (per-window deltas, reset each interval)
+    private val statsInterval = 30_000L
+    private var lastStatsTime = 0L
+    private val windowMediaRx = AtomicLong(0)
+    private val windowNavRx = AtomicLong(0)
+    private val windowMediaPlayed = AtomicLong(0)
+    private val windowNavPlayed = AtomicLong(0)
+    private val windowMediaResiduals = AtomicLong(0)
+    private val windowNavResiduals = AtomicLong(0)
+    private val windowZeroFiltered = AtomicLong(0)
+    private var prevNavOverflow = 0
+    private var prevNavUnderruns = 0
+
     private val bufferMultiplier = audioConfig.bufferMultiplier
-
-    // Playback chunk size in bytes (5ms of audio at configured sample rate, stereo)
-    private val playbackChunkSize = audioConfig.sampleRate * 2 * 2 * 5 / 1000 // ~960 bytes at 48kHz
-
-    // Pre-fill threshold: minimum buffer level (ms) before starting playback
-    // Prevents initial underruns by ensuring buffer has enough data
-    // Platform-specific: 150ms default, 200ms for GM AAOS
     private val prefillThresholdMs = audioConfig.prefillThresholdMs
-
-    // Underrun recovery threshold: if this many underruns occur in a short period,
-    // reset pre-fill to allow buffer to refill before resuming playback
     private val underrunRecoveryThreshold = 10
+    private val minBufferLevelMs = 0 // AudioTrack internal buffer (4x min) provides jitter protection
 
-    // Minimum buffer level (ms) to maintain during playback
-    // This prevents draining the buffer to 0ms which causes underruns
-    // Keep at least this much data in the ring buffer as headroom for USB jitter
-    // Reduced from 100ms to 50ms based on captured USB data showing P99 jitter of only 7ms
-    private val minBufferLevelMs = 50
-
-    // Track whether each stream has started playing (for pre-fill logic)
-    @Volatile private var mediaStarted = false
+    // AUDIO_ROUTE dedup: only log when route changes, plus periodic summary
+    private var lastRoutePurpose: StreamPurpose? = null
+    private var lastRouteSampleRate: Int = 0
+    private var lastRouteChannels: Int = 0
+    private var routeRepeatCount: Long = 0
 
     @Volatile private var navStarted = false
 
-    // Track start times for minimum playback duration enforcement
-    // Prevents premature stop when adapter sends stop command too quickly
     @Volatile private var navStartTime: Long = 0
 
-    @Volatile private var voiceStartTime: Long = 0
+    @Volatile private var navPendingPlay = false
 
-    // Minimum playback duration (ms) before allowing stream stop
-    // This fixes premature nav/Siri audio cutoff observed in Sessions 1-2
+    /**
+     * Per-purpose audio slot: owns AudioTrack + ring buffer + playback state.
+     * Pre-allocated at init, one per stream purpose. Format may change if adapter
+     * sends unexpected decode types (rare — triggers track recreation).
+     */
+    private class PurposeSlot(
+        var format: AudioFormatConfig,
+        val purpose: StreamPurpose,
+        var track: AudioTrack?,
+        var buffer: AudioRingBuffer,
+        var started: Boolean = false,
+        var pendingPlay: Boolean = false,
+        var residualOffset: Int = 0,
+        var residualCount: Int = 0,
+        var underruns: Int = 0,
+        var tempBuffer: ByteArray,
+        // Stats delta tracking
+        var prevOverflow: Int = 0,
+        var prevUnderruns: Int = 0,
+        // Idle-pause: timestamp when buffer first went empty while playing.
+        // Track paused after idlePauseMs to release AAOS volume context.
+        var idleSince: Long = 0,
+    )
+
+    // After a slot's ring buffer has been empty for this long while playing, take
+    // an idle action. Prevents AAOS volume keys from being hijacked by stale PLAYING
+    // tracks. Action depends on purpose (see playback-thread idle handling at line ~1170):
+    //   - MEDIA, PHONE_CALL, SIRI: write a silence frame to keep the track PLAYING
+    //     (avoids volume-context flap during natural inter-packet gaps).
+    //   - ALERT: actually pause (short bursts with explicit start/end signals).
+    private val idlePauseMs = 200L
+
+    // Reject NAVI_COMPLETE if the prompt has been audible for less than this many ms
+    // and the buffer still holds >50ms of data — guards against the adapter sending
+    // STOP before the prompt has had time to play.
     private val minNavPlayDurationMs = 300
-    private val minVoicePlayDurationMs = 200
 
-    // Warmup skip duration (ms) - skip initial frames after stream start to avoid codec warmup noise
-    // Observed in logs: mixed 0xFFFF/0x0000/0xFEFF patterns at NavStart for ~200-400ms
+    // Skip warmup noise: mixed 0xFFFF/0x0000/0xFEFF patterns for ~200-400ms after NavStart
     private val navWarmupSkipMs = 250
 
-    // Count of nav end markers detected (for statistics)
     private var navEndMarkersDetected: Long = 0
-
-    // Count of warmup frames skipped
     private var navWarmupFramesSkipped: Long = 0
 
-    // Consecutive zero-filled packet tracking for navigation
-    // Flush buffer after multiple consecutive zero packets to prevent noise from resampling
+    // Flush after consecutive zero packets to prevent resampling noise on GM AAOS
     private var consecutiveNavZeroPackets: Int = 0
-    private val navZeroFlushThreshold = 3 // Flush after 3 consecutive zero packets
+    private val navZeroFlushThreshold = 3
 
-    // Navigation stopped state - stop accepting nav packets after NAVI_STOP until next NAVI_START
-    // USB captures show adapter sends ~2 seconds of silence after NAVI_STOP before NAVI_COMPLETE
-    // These silence packets should be dropped to prevent playback artifacts
+    // Drop nav packets after NAVI_STOP (~2s silence before NAVI_COMPLETE per USB captures)
     @Volatile private var navStopped = false
-
-    @Volatile private var voiceStarted = false
-
-    @Volatile private var callStarted = false
 
     private val lock = Any()
 
@@ -191,8 +228,13 @@ class DualStreamAudioManager(
             }
 
             try {
-                startTime = System.currentTimeMillis()
                 isRunning.set(true)
+
+                // Pre-allocate per-purpose audio slots
+                mediaSlot = createPurposeSlot(StreamPurpose.MEDIA, AudioFormats.FORMAT_4)
+                siriSlot = createPurposeSlot(StreamPurpose.SIRI, AudioFormats.FORMAT_5)
+                phoneCallSlot = createPurposeSlot(StreamPurpose.PHONE_CALL, AudioFormats.FORMAT_3)
+                alertSlot = createPurposeSlot(StreamPurpose.ALERT, AudioFormats.FORMAT_6)
 
                 // Start playback thread
                 playbackThread = AudioPlaybackThread().also { it.start() }
@@ -208,7 +250,8 @@ class DualStreamAudioManager(
                         "sampleRate=${audioConfig.sampleRate}Hz, " +
                         "bufferMult=${audioConfig.bufferMultiplier}x, " +
                         "perfMode=$perfModeStr, " +
-                        "prefill=${audioConfig.prefillThresholdMs}ms",
+                        "prefill=${audioConfig.prefillThresholdMs}ms, " +
+                        "slots=MEDIA/SIRI/PHONE_CALL/ALERT pre-allocated",
                 )
                 return true
             } catch (e: Exception) {
@@ -220,43 +263,30 @@ class DualStreamAudioManager(
     }
 
     /**
-     * Check if audio data is entirely zero-filled (invalid/uninitialized data).
-     *
-     * Real audio, even during silent moments, contains dithering noise.
-     * Packets that are exactly 0x00 for every byte indicate adapter issues.
-     *
-     * IMPORTANT: Audio packet format is 12-byte header + PCM samples.
-     * Header: [audioType(4) + volume(4) + decodeType(4)]
-     * We must skip the header and only check the PCM audio data portion,
-     * otherwise the non-zero audioType byte causes false negatives.
-     *
-     * Samples multiple positions for efficiency (O(1) check).
+     * Check if audio data is zero-filled (adapter issue).
+     * Real audio has dithering noise even during silence.
      */
-    private fun isZeroFilledAudio(data: ByteArray): Boolean {
-        // Audio data format: 12-byte header + PCM samples
-        val headerSize = 12
-        val audioDataSize = data.size - headerSize
+    private fun isZeroFilledAudio(
+        data: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Boolean {
+        if (length < 16) return false
+        val end = offset + length
 
-        // Need at least 16 bytes of audio data to check
-        if (audioDataSize < 16) return false
-
-        // Sample 5 positions across the AUDIO DATA (after header, aligned to 2-byte boundary)
         val positions =
             intArrayOf(
-                headerSize,
-                headerSize + ((audioDataSize * 0.25).toInt() and 0x7FFFFFFE),
-                headerSize + ((audioDataSize * 0.5).toInt() and 0x7FFFFFFE),
-                headerSize + ((audioDataSize * 0.75).toInt() and 0x7FFFFFFE),
-                headerSize + ((audioDataSize - 8).coerceAtLeast(0) and 0x7FFFFFFE),
+                offset,
+                offset + ((length * 0.25).toInt() and 0x7FFFFFFE),
+                offset + ((length * 0.5).toInt() and 0x7FFFFFFE),
+                offset + ((length * 0.75).toInt() and 0x7FFFFFFE),
+                offset + ((length - 8).coerceAtLeast(0) and 0x7FFFFFFE),
             )
 
         for (pos in positions) {
-            if (pos + 4 > data.size) continue
-            // Check 4 consecutive bytes - if any non-zero, it's real audio
-            if (data[pos] != 0.toByte() ||
-                data[pos + 1] != 0.toByte() ||
-                data[pos + 2] != 0.toByte() ||
-                data[pos + 3] != 0.toByte()
+            if (pos + 4 > end) continue
+            if (data[pos] != 0.toByte() || data[pos + 1] != 0.toByte() ||
+                data[pos + 2] != 0.toByte() || data[pos + 3] != 0.toByte()
             ) {
                 return false
             }
@@ -265,334 +295,181 @@ class DualStreamAudioManager(
     }
 
     /**
-     * Detect navigation end marker (solid 0xFFFF pattern).
-     *
-     * The CPC200-CCPA adapter sends a solid 0xFFFF frame as an end-of-stream marker
-     * just before NaviStop. This is distinct from warmup noise which contains mixed
-     * patterns (0xFFFF/0x0000/0xFEFF).
-     *
-     * When detected:
-     * 1. Don't write to ring buffer (marker is not audio)
-     * 2. Flush both ring buffer and AudioTrack to clear stale data
-     * 3. Next NaviStart gets a clean buffer with no residual audio
-     *
-     * @param data Audio data to check
-     * @return true if this is a solid 0xFFFF end marker
+     * Detect nav end marker (solid 0xFFFF). Adapter sends before NaviStop.
+     * Distinct from warmup noise (mixed 0xFFFF/0x0000/0xFEFF patterns).
+     * When detected: flush buffers for clean next NaviStart.
      */
-    private fun isNavEndMarker(data: ByteArray): Boolean {
-        // Audio data format: 12-byte header + PCM samples
-        // Header: [audioType(4) + unknown(4) + format(4)]
-        // Skip header when checking for 0xFFFF pattern
-        val headerSize = 12
-        val audioDataSize = data.size - headerSize
+    private fun isNavEndMarker(
+        data: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Boolean {
+        if (length < 32) return false
+        val end = offset + length
 
-        if (audioDataSize < 32) return false
-
-        // Sample 4 positions across the AUDIO DATA (after header)
-        // Must ALL be 0xFFFF for end marker
-        // Warmup noise has mixed patterns (0xFEFF, 0x0000) so won't match
+        // Sample 4 positions - all must be 0xFFFF for end marker
         val positions =
             intArrayOf(
-                headerSize, // Start of audio data
-                headerSize + ((audioDataSize * 0.25).toInt() and 0x7FFFFFFE),
-                headerSize + ((audioDataSize * 0.5).toInt() and 0x7FFFFFFE),
-                headerSize + ((audioDataSize * 0.75).toInt() and 0x7FFFFFFE),
+                offset,
+                offset + ((length * 0.25).toInt() and 0x7FFFFFFE),
+                offset + ((length * 0.5).toInt() and 0x7FFFFFFE),
+                offset + ((length * 0.75).toInt() and 0x7FFFFFFE),
             )
 
-        // Collect sample values for debug logging
-        val sampleValues = StringBuilder()
-        var allMatch = true
-
-        for ((index, pos) in positions.withIndex()) {
-            if (pos + 3 >= data.size) continue
-            val b0 = data[pos].toInt() and 0xFF
-            val b1 = data[pos + 1].toInt() and 0xFF
-            val b2 = data[pos + 2].toInt() and 0xFF
-            val b3 = data[pos + 3].toInt() and 0xFF
-
-            if (index > 0) sampleValues.append(" ")
-            sampleValues.append(String.format("%02X%02X%02X%02X", b0, b1, b2, b3))
-
-            // Must be exactly 0xFFFF 0xFFFF (2 consecutive 16-bit samples = -1)
-            if (data[pos] != 0xFF.toByte() ||
-                data[pos + 1] != 0xFF.toByte() ||
-                data[pos + 2] != 0xFF.toByte() ||
-                data[pos + 3] != 0xFF.toByte()
+        for (pos in positions) {
+            if (pos + 3 >= end) continue
+            if (data[pos] != 0xFF.toByte() || data[pos + 1] != 0xFF.toByte() ||
+                data[pos + 2] != 0xFF.toByte() || data[pos + 3] != 0xFF.toByte()
             ) {
-                allMatch = false
+                return false
             }
         }
 
-        // Log pattern detection result
-        AudioDebugLogger.logNavPatternCheck("end_marker", allMatch, sampleValues.toString())
-
-        return allMatch
+        return true
     }
 
     /**
-     * Detect warmup noise pattern (mixed near-silence with 0xFFFF/0x0000/0xFEFF).
-     *
-     * Codec warmup noise appears at NavStart for ~200-400ms before valid audio.
-     * These frames contain alternating patterns of near-silence values that
-     * cause audible distortion if played.
-     *
-     * Pattern characteristics:
-     * - Mix of 0xFFFF (-1), 0x0000 (0), 0xFEFF (-257) values
-     * - NOT solid 0xFFFF (that's end marker)
-     * - Occurs in first ~250ms after nav stream starts
-     *
-     * @param data Audio data to check
-     * @return true if this appears to be warmup noise
+     * Detect warmup noise (near-silence mix of 0xFFFF/0x0000/0xFEFF).
+     * Appears ~200-400ms after NavStart. Causes distortion if played.
      */
-    private fun isWarmupNoise(data: ByteArray): Boolean {
-        // Audio data format: 12-byte header + PCM samples
-        val headerSize = 12
-        val audioDataSize = data.size - headerSize
+    private fun isWarmupNoise(
+        data: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Boolean {
+        if (length < 32) return false
+        val end = offset + length
 
-        if (audioDataSize < 32) return false
-
-        // Sample 8 positions across the AUDIO DATA (after header)
         val sampleCount = 8
         var nearSilenceCount = 0
-        val sampleValues = StringBuilder()
 
         for (i in 0 until sampleCount) {
-            val pos = headerSize + (((audioDataSize * i) / sampleCount) and 0x7FFFFFFE)
-            if (pos + 1 >= data.size) continue
+            val pos = offset + (((length * i) / sampleCount) and 0x7FFFFFFE)
+            if (pos + 1 >= end) continue
 
-            // Read 16-bit sample (little-endian)
             val sample = (data[pos].toInt() and 0xFF) or ((data[pos + 1].toInt() and 0xFF) shl 8)
             val signedSample = if (sample >= 32768) sample - 65536 else sample
 
-            if (i > 0) sampleValues.append(",")
-            sampleValues.append(signedSample)
-
-            // Check for near-silence values: 0, -1, -2, -256, -257, -258, 1, 2
-            // Note: -1 and -257 are already covered by the range -258..2
-            if (signedSample in -258..2) {
-                nearSilenceCount++
-            }
+            if (signedSample in -258..2) nearSilenceCount++
         }
 
-        // If most samples are near-silence but not ALL 0xFFFF (checked by isNavEndMarker),
-        // this is warmup noise
-        val isWarmup = nearSilenceCount >= 6 // 6 out of 8 samples are near-silence
-
-        // Log pattern detection result
-        AudioDebugLogger.logNavPatternCheck("warmup_noise", isWarmup, "$nearSilenceCount/8 near-silence: [$sampleValues]")
-
-        return isWarmup
+        return nearSilenceCount >= 6
     }
 
-    /**
-     * Flush navigation buffers immediately.
-     *
-     * Called when nav end marker (0xFFFF) is detected to clear stale data.
-     * This ensures next nav prompt starts with clean buffers.
-     */
+    /** Flush nav buffers when end marker (0xFFFF) detected. Ensures clean next prompt. */
     private fun flushNavBuffers() {
         synchronized(lock) {
-            // Capture buffer level before clearing for logging
             val discardedMs = navBuffer?.fillLevelMs() ?: 0
-
-            // Clear ring buffer first (fast, lock-free)
             navBuffer?.clear()
 
-            // Flush AudioTrack internal buffer
-            // Note: flush() is no-op unless track is paused/stopped
+            // flush() requires paused state; track resumes via ensureNavTrack on next audio
             navTrack?.let { track ->
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                     track.pause()
                     track.flush()
-                    // Don't resume - NaviStop will arrive shortly
-                    // Track will be resumed by ensureNavTrack when next nav audio arrives
                 }
             }
 
             navEndMarkersDetected++
-            AudioDebugLogger.logNavBufferFlush("end_marker", discardedMs)
-            log("[AUDIO] Nav end marker detected, buffers flushed (total: $navEndMarkersDetected)")
+            log("[AUDIO] Nav end marker detected, buffers flushed — discarded=${discardedMs}ms (total: $navEndMarkersDetected)")
         }
     }
 
-    /**
-     * Write audio data to the appropriate stream buffer (non-blocking).
-     *
-     * Called from USB thread. Never blocks.
-     *
-     * @param data PCM audio data (16-bit)
-     * @param audioType Stream type (1=media, 2=navigation)
-     * @param decodeType CPC200-CCPA format type (1-7)
-     * @return Number of bytes written to buffer
-     */
+    /** Write audio to stream buffer (non-blocking, USB thread). Returns bytes written. */
     fun writeAudio(
         data: ByteArray,
+        dataOffset: Int,
+        dataLength: Int,
         audioType: Int,
         decodeType: Int,
+        routingState: AudioRoutingState = AudioRoutingState(),
     ): Int {
         if (!isRunning.get()) return -1
 
-        // Debug logging for USB audio reception
-        AudioDebugLogger.logUsbReceive(data.size, audioType, decodeType)
-
-        // Check for zero-filled packets (adapter firmware issue / uninitialized data)
-        // Note: Navigation gets special handling below to track consecutive zeros and flush buffers
-        val isZeroFilled = isZeroFilledAudio(data)
+        // Navigation handles zeros separately for consecutive tracking and buffer flush
+        val isZeroFilled = isZeroFilledAudio(data, dataOffset, dataLength)
         if (isZeroFilled && audioType != AudioStreamType.NAVIGATION) {
-            // For non-navigation streams, just filter and count
-            zeroPacketsFiltered++
-            AudioDebugLogger.logUsbFiltered(audioType, zeroPacketsFiltered)
-            if (BuildConfig.DEBUG && (zeroPacketsFiltered == 1L || zeroPacketsFiltered % 100 == 0L)) {
-                Log.w(TAG, "[AUDIO_FILTER] Filtered $zeroPacketsFiltered zero-filled packets")
-            }
-            return 0 // Return 0 to indicate no bytes written (not an error)
+            windowZeroFiltered.incrementAndGet()
+            return 0
         }
 
-        writeCount++
-
-        // DEBUG: Log every 500th packet with first bytes and buffer stats
-        if (BuildConfig.DEBUG && writeCount % 500 == 1L) {
-            val firstBytes =
-                data.take(16).joinToString(" ") { String.format(java.util.Locale.US, "%02X", it) }
-            val bufferStats =
-                mediaBuffer?.let {
-                    "fill=${it.fillLevelMs()}ms overflow=${it.overflowCount} underflow=${it.underflowCount}"
-                } ?: "no-buffer"
-            Log.i(
-                TAG,
-                "[AUDIO_DEBUG] write#$writeCount size=${data.size} type=$audioType " +
-                    "decode=$decodeType first16=[$firstBytes] $bufferStats",
-            )
-        }
-
-        // DEBUG: Log buffer stats every 10 seconds
-        if (BuildConfig.DEBUG) {
-            val now = System.currentTimeMillis()
-            if (now - lastStatsLog > 10000) {
-                lastStatsLog = now
-                mediaBuffer?.let {
-                    Log.i(
-                        TAG,
-                        "[AUDIO_STATS] mediaBuffer: fill=${it.fillLevelMs()}ms/${it.fillLevel() * 100}% " +
-                            "written=${it.totalBytesWritten} read=${it.totalBytesRead} " +
-                            "overflow=${it.overflowCount} underflow=${it.underflowCount}",
-                    )
-                }
-            }
-        }
-
-        // Route to appropriate AudioTrack based on stream type
-        // Each stream maps to a specific AAOS CarAudioContext for proper vehicle integration
+        // Route: Navigation → nav track, everything else → per-purpose pre-allocated track
         return when (audioType) {
-            AudioStreamType.MEDIA -> {
-                // USAGE_MEDIA → CarAudioContext.MUSIC
-                ensureMediaTrack(decodeType)
-                mediaBuffer?.write(data) ?: -1
-            }
-
             AudioStreamType.NAVIGATION -> {
-                // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → CarAudioContext.NAVIGATION
+                // Drop packets after NAVI_STOP (~2s silence before NAVI_COMPLETE per USB captures)
+                if (navStopped) return 0
 
-                // Drop nav packets after NAVI_STOP received (until next NAVI_START)
-                // USB captures show ~2 seconds of silence packets sent after NAVI_STOP
-                if (navStopped) {
+                // Check end marker before track creation (navStartTime may be 0 — this is
+                // the cold-start path; nav track never allocated in 2026-04-20 POTATO
+                // sessions, Nav[Rx:0] in every AUDIO_PERF log).
+                if (isNavEndMarker(data, dataOffset, dataLength)) {
+                    flushNavBuffers()
+                    consecutiveNavZeroPackets = 0
                     return 0
                 }
 
-                val bufferLevelMs = navBuffer?.fillLevelMs() ?: 0
-
-                // Check for end marker FIRST (before ensuring track)
-                // Use safe time calculation (navStartTime may be 0 before track created)
-                val preTrackTimeSinceStart = if (navStartTime > 0) System.currentTimeMillis() - navStartTime else 0L
-                if (isNavEndMarker(data)) {
-                    // End marker detected - flush buffers to prevent stale data playback
-                    AudioDebugLogger.logNavEndMarker(preTrackTimeSinceStart, bufferLevelMs)
-                    flushNavBuffers()
-                    consecutiveNavZeroPackets = 0
-                    return 0 // Don't write marker to buffer
-                }
-
-                // Handle zero-filled packets for navigation with consecutive tracking
-                // Multiple consecutive zeros indicate adapter sending empty audio, which
-                // causes resampling artifacts (noise) on GM AAOS when 44.1kHz→48kHz resampling occurs
+                // Consecutive zeros cause resampling noise on GM AAOS (44.1kHz→48kHz)
                 if (isZeroFilled) {
                     consecutiveNavZeroPackets++
-                    zeroPacketsFiltered++
+                    windowZeroFiltered.incrementAndGet()
                     if (consecutiveNavZeroPackets >= navZeroFlushThreshold) {
-                        // Multiple consecutive zero packets - flush buffer to prevent noise
-                        AudioDebugLogger.logNavZeroFlush(consecutiveNavZeroPackets, bufferLevelMs)
                         flushNavBuffers()
                         log(
-                            "[AUDIO_FILTER] Nav buffer flushed after $consecutiveNavZeroPackets consecutive " +
-                                "zero packets (total filtered: $zeroPacketsFiltered)",
+                            "[AUDIO_FILTER] Nav buffer flushed after " +
+                                "$consecutiveNavZeroPackets consecutive zero packets",
                         )
                         consecutiveNavZeroPackets = 0
                     }
-                    return 0 // Don't write zero data to buffer
+                    return 0
                 }
 
-                // Valid audio - reset consecutive zero counter
                 consecutiveNavZeroPackets = 0
-
-                // Ensure track exists (creates track and sets navStartTime on first call)
                 ensureNavTrack(decodeType)
-
-                // Calculate time since start AFTER track is ensured (navStartTime now valid)
                 val timeSinceStart = System.currentTimeMillis() - navStartTime
 
-                // Skip warmup noise in first ~250ms after stream start
-                if (timeSinceStart < navWarmupSkipMs && isWarmupNoise(data)) {
+                // Skip warmup noise in first ~250ms
+                if (timeSinceStart < navWarmupSkipMs && isWarmupNoise(data, dataOffset, dataLength)) {
                     navWarmupFramesSkipped++
-                    AudioDebugLogger.logNavWarmupSkip(timeSinceStart, "near-silence")
                     if (navWarmupFramesSkipped == 1L || navWarmupFramesSkipped % 10 == 0L) {
-                        log("[AUDIO] Skipped nav warmup frame (${timeSinceStart}ms since start, total: $navWarmupFramesSkipped)")
+                        log(
+                            "[AUDIO] Skipped nav warmup frame " +
+                                "(${timeSinceStart}ms since start, total: $navWarmupFramesSkipped)",
+                        )
                     }
-                    return 0 // Don't write warmup noise to buffer
+                    return 0
                 }
 
-                // Write to nav buffer and log
-                val bytesWritten = navBuffer?.write(data) ?: -1
+                windowNavRx.incrementAndGet()
+                val bytesWritten = navBuffer?.write(data, dataOffset, dataLength) ?: -1
                 if (bytesWritten > 0) {
                     navPackets++
-                    AudioDebugLogger.logNavBufferWrite(bytesWritten, navBuffer?.fillLevelMs() ?: 0, timeSinceStart)
                 }
                 bytesWritten
             }
 
-            AudioStreamType.SIRI -> {
-                // USAGE_ASSISTANT → CarAudioContext.VOICE_COMMAND
-                ensureVoiceTrack(decodeType)
-                voiceBuffer?.write(data) ?: -1
-            }
-
-            AudioStreamType.PHONE_CALL -> {
-                // USAGE_VOICE_COMMUNICATION → CarAudioContext.CALL
-                ensureCallTrack(decodeType)
-                callBuffer?.write(data) ?: -1
-            }
-
             else -> {
-                // Default to media stream for unknown types
-                ensureMediaTrack(decodeType)
-                mediaBuffer?.write(data) ?: -1
+                // Two-factor routing: state flags + format match → pre-allocated slot
+                windowMediaRx.incrementAndGet()
+                val format = AudioFormats.fromDecodeType(decodeType)
+                val targetSlot = resolveTargetSlot(format, routingState) ?: return 0
+                ensureSlotFormat(targetSlot, format)
+                // Activate slot if track is not yet playing (pre-allocated slots start in STOPPED)
+                if (!targetSlot.pendingPlay && targetSlot.track?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    targetSlot.pendingPlay = true
+                    targetSlot.started = false
+                }
+                targetSlot.buffer.write(data, dataOffset, dataLength)
             }
         }
     }
 
-    /**
-     * Set volume ducking state.
-     *
-     * Called when adapter sends Len=16 volume packets.
-     *
-     * @param targetVolume Target volume (0.0 to 1.0), typically 0.2 during nav
-     */
+    /** Set media ducking (Len=16 volume packets from adapter). */
     fun setDucking(targetVolume: Float) {
         synchronized(lock) {
             isDucked = targetVolume < 1.0f
             duckLevel = targetVolume.coerceIn(0.0f, 1.0f)
 
-            val effectiveVolume = if (isDucked) mediaVolume * duckLevel else mediaVolume
-            mediaTrack?.setVolume(effectiveVolume)
+            applyEffectiveVolume()
 
             if (isDucked) {
                 log("[AUDIO] Media ducked to ${(duckLevel * 100).toInt()}%")
@@ -602,76 +479,105 @@ class DualStreamAudioManager(
         }
     }
 
-    /**
-     * Set media stream volume.
-     *
-     * @param volume Volume level (0.0 to 1.0)
-     */
-    fun setMediaVolume(volume: Float) {
-        synchronized(lock) {
-            mediaVolume = volume.coerceIn(0.0f, 1.0f)
-            val effectiveVolume = if (isDucked) mediaVolume * duckLevel else mediaVolume
-            mediaTrack?.setVolume(effectiveVolume)
-        }
-    }
-
-    /**
-     * Set navigation stream volume.
-     *
-     * @param volume Volume level (0.0 to 1.0)
-     */
-    fun setNavVolume(volume: Float) {
-        synchronized(lock) {
-            navVolume = volume.coerceIn(0.0f, 1.0f)
-            navTrack?.setVolume(navVolume)
-        }
-    }
-
-    /**
-     * Check if audio is currently playing.
-     */
-    fun isPlaying(): Boolean =
-        isRunning.get() && (
-            mediaTrack?.playState == AudioTrack.PLAYSTATE_PLAYING ||
-                navTrack?.playState == AudioTrack.PLAYSTATE_PLAYING ||
-                voiceTrack?.playState == AudioTrack.PLAYSTATE_PLAYING ||
-                callTrack?.playState == AudioTrack.PLAYSTATE_PLAYING
+    /** Combine adapter ducking and system focus ducking, apply to media slot only.
+     *  Adapter duck (duckLevel) only applies when explicitly set via volumeDuration packet (isDucked=true).
+     *  System focus duck (focusDuckLevel) always applies — it tracks Android AudioFocus state. */
+    private fun applyEffectiveVolume() {
+        val adapterFactor = if (isDucked) duckLevel else 1.0f
+        val effectiveVolume = mediaVolume * minOf(adapterFactor, focusDuckLevel)
+        mediaSlot?.track?.setVolume(effectiveVolume)
+        // Non-media purpose slots (PHONE_CALL, SIRI, ALERT) stay at full volume
+        logDebug(
+            "[AUDIO_FOCUS] Volume: effective=${(effectiveVolume * 100).toInt()}% " +
+                "(media=${(mediaVolume * 100).toInt()}% adapterDuck=${if (isDucked) "${(duckLevel * 100).toInt()}%" else "off"} " +
+                "focusDuck=${(focusDuckLevel * 100).toInt()}%)",
         )
+    }
 
-    /**
-     * Get statistics about audio playback.
-     */
-    fun getStats(): Map<String, Any> {
+    /** Request AudioFocus for a stream purpose. */
+    fun onPurposeChanged(purpose: StreamPurpose) {
         synchronized(lock) {
-            val durationMs = if (startTime > 0) System.currentTimeMillis() - startTime else 0
+            val gainType =
+                when (purpose) {
+                    StreamPurpose.MEDIA -> AudioManager.AUDIOFOCUS_GAIN
+                    StreamPurpose.PHONE_CALL -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.SIRI -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.ALERT, StreamPurpose.RINGTONE -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.NAVIGATION -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                }
 
-            return mapOf(
-                "isRunning" to isRunning.get(),
-                "durationSeconds" to durationMs / 1000.0,
-                "mediaVolume" to mediaVolume,
-                "navVolume" to navVolume,
-                "voiceVolume" to voiceVolume,
-                "callVolume" to callVolume,
-                "isDucked" to isDucked,
-                "duckLevel" to duckLevel,
-                "mediaFormat" to (mediaFormat?.let { "${it.sampleRate}Hz ${it.channelCount}ch" } ?: "none"),
-                "navFormat" to (navFormat?.let { "${it.sampleRate}Hz ${it.channelCount}ch" } ?: "none"),
-                "voiceFormat" to (voiceFormat?.let { "${it.sampleRate}Hz ${it.channelCount}ch" } ?: "none"),
-                "callFormat" to (callFormat?.let { "${it.sampleRate}Hz ${it.channelCount}ch" } ?: "none"),
-                "mediaBuffer" to (mediaBuffer?.getStats() ?: emptyMap()),
-                "navBuffer" to (navBuffer?.getStats() ?: emptyMap()),
-                "voiceBuffer" to (voiceBuffer?.getStats() ?: emptyMap()),
-                "callBuffer" to (callBuffer?.getStats() ?: emptyMap()),
-                "mediaUnderruns" to mediaUnderruns,
-                "navUnderruns" to navUnderruns,
-                "voiceUnderruns" to voiceUnderruns,
-                "callUnderruns" to callUnderruns,
-                "navEndMarkersDetected" to navEndMarkersDetected,
-                "navWarmupFramesSkipped" to navWarmupFramesSkipped,
-                "zeroPacketsFiltered" to zeroPacketsFiltered,
-            )
+            val (usage, contentType) = purposeToAttributes(purpose)
+
+            val focusRequest =
+                AudioFocusRequest
+                    .Builder(gainType)
+                    .setAudioAttributes(
+                        AudioAttributes
+                            .Builder()
+                            .setUsage(usage)
+                            .setContentType(contentType)
+                            .build(),
+                    ).setOnAudioFocusChangeListener(getOrCreateFocusListener(purpose), focusHandler)
+                    .build()
+
+            val result = systemAudioManager.requestAudioFocus(focusRequest)
+            activeFocusRequests[purpose] = focusRequest
+
+            // Reset focusDuckLevel when MEDIA focus is granted. With per-purpose listeners,
+            // MEDIA's listener gets proper GAIN callbacks when unblocked, but the sync reset
+            // handles the case where MEDIA focus was re-requested after abandonment.
+            if (purpose == StreamPurpose.MEDIA && result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED && focusDuckLevel != 1.0f) {
+                logDebug("[AUDIO_FOCUS] Reset focusDuckLevel=100% (MEDIA focus granted)")
+                focusDuckLevel = 1.0f
+                applyEffectiveVolume()
+            }
+
+            val resultStr =
+                when (result) {
+                    AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "GRANTED"
+                    AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> "DELAYED"
+                    AudioManager.AUDIOFOCUS_REQUEST_FAILED -> "FAILED"
+                    else -> "UNKNOWN($result)"
+                }
+            val gainStr =
+                when (gainType) {
+                    AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> "GAIN_TRANSIENT"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> "GAIN_TRANSIENT_MAY_DUCK"
+                    else -> "UNKNOWN($gainType)"
+                }
+            logDebug("[AUDIO_FOCUS] Request $purpose: gain=$gainStr → $resultStr")
         }
     }
+
+    /** Abandon AudioFocus for a stream purpose. */
+    fun onPurposeEnded(purpose: StreamPurpose) {
+        synchronized(lock) {
+            activeFocusRequests.remove(purpose)?.let { request ->
+                systemAudioManager.abandonAudioFocusRequest(request)
+                logDebug("[AUDIO_FOCUS] Abandon $purpose")
+            }
+            focusListeners.remove(purpose)
+        }
+    }
+
+    private fun purposeToAttributes(purpose: StreamPurpose): Pair<Int, Int> =
+        when (purpose) {
+            StreamPurpose.MEDIA -> Pair(AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC)
+            StreamPurpose.PHONE_CALL -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION, AudioAttributes.CONTENT_TYPE_SPEECH)
+            StreamPurpose.SIRI -> Pair(AudioAttributes.USAGE_ASSISTANT, AudioAttributes.CONTENT_TYPE_SPEECH)
+            // ALERT (incoming-call ringtone): try USAGE_VOICE_COMMUNICATION_SIGNALLING
+            // to attempt routing onto BUS_CALL_RING → vgroup 2 (RING) on GM AAOS.
+            // Standard AOSP maps USAGE_NOTIFICATION_RINGTONE to CALL_RING context, but
+            // GM's carAudioContexts.xml on this head unit remaps it to BUS_NOTIFICATION
+            // (vgroup 6 SYSTEM) — not adjustable, not on the right physical bus.
+            // SIGNALLING is the closest usage that semantically belongs to the telephony
+            // group and may map to BUS_CALL_RING in GM's config without requiring a
+            // Telecom ConnectionService. Fallback: USAGE_NOTIFICATION_RINGTONE.
+            StreamPurpose.ALERT -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            StreamPurpose.RINGTONE -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            StreamPurpose.NAVIGATION -> Pair(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE, AudioAttributes.CONTENT_TYPE_SPEECH)
+        }
 
     // ========== Stream Stop Methods ==========
     //
@@ -688,28 +594,19 @@ class DualStreamAudioManager(
     // Using pause() instead of stop() preserves the buffer and allows quick resume
     // when the stream restarts, avoiding audio glitches.
 
-    /**
-     * Signal navigation stream stopped - stop accepting new nav packets.
-     * Called when AUDIO_NAVI_STOP command is received from the adapter.
-     *
-     * USB captures show adapter sends ~2 seconds of silence packets after NAVI_STOP
-     * before finally sending NAVI_COMPLETE. This method prevents those silence
-     * packets from being written to the buffer, avoiding playback artifacts.
-     *
-     * The actual track cleanup happens when NAVI_COMPLETE is received.
-     */
+    /** Reset nav stopped state (AUDIO_NAVI_START). Allows packets after a prior NAVI_STOP. */
+    fun onNavStarted() {
+        navStopped = false
+        logDebug("[AUDIO_TRACK] onNavStarted() - accepting nav packets")
+    }
+
+    /** Stop accepting nav packets (AUDIO_NAVI_STOP). Track cleanup on NAVI_COMPLETE. */
     fun onNavStopped() {
         log("[NAV_STOP] onNavStopped() called - will reject incoming nav packets")
         navStopped = true
     }
 
-    /**
-     * Pause navigation AudioTrack when nav audio stream ends.
-     * Called when AUDIO_NAVI_COMPLETE command is received from the adapter.
-     *
-     * Enforces minimum playback duration to prevent premature cutoff when adapter
-     * sends stop command too quickly (observed in Sessions 1-2).
-     */
+    /** Pause nav track (AUDIO_NAVI_COMPLETE). Enforces min duration (Sessions 1-2 fix). */
     fun stopNavTrack() {
         log("[NAV_STOP] stopNavTrack() called")
 
@@ -725,7 +622,6 @@ class DualStreamAudioManager(
 
             navTrack?.let { track ->
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    // Check minimum playback duration
                     val playDuration = System.currentTimeMillis() - navStartTime
                     val bufferLevel = navBuffer?.fillLevelMs() ?: 0
                     val bytesRead = navBuffer?.totalBytesRead ?: 0
@@ -743,15 +639,11 @@ class DualStreamAudioManager(
                         return
                     }
 
-                    // Pause and flush to clear any remaining stale data
-                    // This is a secondary safeguard - primary flush happens on 0xFFFF end marker
+                    // Secondary flush (primary is on 0xFFFF end marker)
                     track.pause()
                     track.flush()
                     val discardedMs = navBuffer?.fillLevelMs() ?: 0
                     navBuffer?.clear()
-                    AudioDebugLogger.logNavBufferFlush("stop_command", discardedMs)
-                    AudioDebugLogger.logNavPromptEnd(playDuration, bytesRead, navUnderruns)
-                    AudioDebugLogger.logStreamStop("NAV", playDuration, navPackets)
                     log(
                         "[NAV_STOP] Nav track paused+flushed after ${playDuration}ms - " +
                             "discarded=${discardedMs}ms, packets=$navPackets, underruns=$navUnderruns",
@@ -764,178 +656,130 @@ class DualStreamAudioManager(
             }
 
             navStarted = false
+            navPendingPlay = false
             navStopped = false // Reset stopped state for next nav session
             navPackets = 0 // Reset packet counter for next nav prompt
             navUnderruns = 0 // Reset underrun counter for next nav prompt
+            navWarmupFramesSkipped = 0 // Reset per-prompt warmup skip counter
+            // Abandon nav focus
+            onPurposeEnded(StreamPurpose.NAVIGATION)
+            logDebug("[AUDIO_FOCUS] Nav focus abandoned (stopNavTrack)")
         }
     }
 
-    // Nav packet counter for debug logging
     private var navPackets: Long = 0
 
     /**
-     * Pause voice assistant AudioTrack when Siri/voice stream ends.
-     * Called when AudioSiriStop command is received from the adapter.
-     *
-     * Enforces minimum playback duration to prevent premature Siri tone cutoff.
+     * Pause the SIRI track on AUDIO_SIRI_STOP. Same rationale as stopPhoneCallTrack:
+     * SIRI now writes silence on idle gaps (TTS inter-utterance pauses) to prevent
+     * mid-session volume-context flap, so it needs an explicit pause at end-of-session
+     * to release the USAGE_ASSISTANT active-player signal back to AAOS.
      */
-    fun stopVoiceTrack() {
+    fun stopSiriTrack() {
+        log("[SIRI_STOP] stopSiriTrack() called")
         synchronized(lock) {
-            voiceTrack?.let { track ->
+            val slot = siriSlot ?: run {
+                log("[SIRI_STOP] siriSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    // Check minimum playback duration
-                    val playDuration = System.currentTimeMillis() - voiceStartTime
-                    val bufferLevel = voiceBuffer?.fillLevelMs() ?: 0
-
-                    if (playDuration < minVoicePlayDurationMs && bufferLevel > 50) {
-                        log(
-                            "[AUDIO] Ignoring premature voice stop after ${playDuration}ms, " +
-                                "buffer has ${bufferLevel}ms data",
-                        )
-                        return
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[SIRI_STOP] pause/flush failed: ${e.message}")
                     }
-
-                    track.pause()
-                    AudioDebugLogger.logStreamStop("VOICE", playDuration, 0)
-                    log(
-                        "[AUDIO] Voice track paused after ${playDuration}ms - " +
-                            "stream ended, AAOS will deprioritize VOICE_COMMAND context",
-                    )
+                    log("[SIRI_STOP] SIRI track paused+flushed")
+                } else {
+                    log("[SIRI_STOP] Track not playing (state=${track.playState}), skipping pause")
                 }
             }
-            voiceStarted = false
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
         }
     }
 
     /**
-     * Pause phone call AudioTrack when call audio stream ends.
-     * Called when AudioPhonecallStop command is received from the adapter.
-     */
-    fun stopCallTrack() {
-        synchronized(lock) {
-            callTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                    log("[AUDIO] Call track paused - stream ended, AAOS will deprioritize CALL context")
-                }
-            }
-            callStarted = false
-        }
-    }
-
-    /**
-     * Pause media AudioTrack when media stream ends.
-     * Called when AudioMediaStop or AudioOutputStop command is received.
-     */
-    fun stopMediaTrack() {
-        synchronized(lock) {
-            mediaTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                    log("[AUDIO] Media track paused - stream ended")
-                }
-            }
-            mediaStarted = false
-        }
-    }
-
-    /**
-     * Suspend playback without releasing resources.
+     * Pause the phone-call track on AUDIO_PHONECALL_STOP.
      *
-     * Use this instead of release() for temporary disconnections (USB hiccups).
-     * Tracks are paused but retained, allowing quick resume without reinitialization.
-     * This prevents the 72+ pipeline resets observed in Session 1.
-     */
-    fun suspendPlayback() {
-        synchronized(lock) {
-            log("[AUDIO] Suspending playback (retaining tracks)")
-
-            mediaTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                }
-            }
-            navTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                }
-            }
-            voiceTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                }
-            }
-            callTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.pause()
-                }
-            }
-
-            // Reset pre-fill flags so tracks wait for buffer to fill before resuming
-            mediaStarted = false
-            navStarted = false
-            voiceStarted = false
-            callStarted = false
-
-            log("[AUDIO] Playback suspended - tracks paused but retained")
-        }
-    }
-
-    /**
-     * Resume playback after suspension.
+     * Required because the idle-pause path no longer pauses PHONE_CALL — it writes
+     * silence to keep the track PLAYING across natural inter-packet gaps (VAD/silence
+     * frames). Without an explicit pause at end-of-call, the AudioTrack stays in
+     * PLAYSTATE_PLAYING with USAGE_VOICE_COMMUNICATION and AAOS keeps routing volume
+     * keys to the CALL group while ducking MEDIA/SIRI to inaudibility — symptom is
+     * "post-call silence: media plays internally but nothing is heard, volume stuck
+     * on call group." NAV breaks through via its own focus request, but on NAV end
+     * the system falls back to the still-playing PHONE_CALL track.
      *
-     * Only resumes tracks that have data in their buffers.
+     * Mirrors stopNavTrack() — pause + flush + reset slot state.
      */
-    fun resumePlayback() {
+    fun stopPhoneCallTrack() {
+        log("[PHONECALL_STOP] stopPhoneCallTrack() called")
         synchronized(lock) {
-            log("[AUDIO] Resuming playback")
-
-            // Tracks will be resumed automatically by ensureXxxTrack() when data arrives
-            // Just log the current state for debugging
-            val states =
-                listOf(
-                    "media=${mediaTrack?.playState ?: "null"}",
-                    "nav=${navTrack?.playState ?: "null"}",
-                    "voice=${voiceTrack?.playState ?: "null"}",
-                    "call=${callTrack?.playState ?: "null"}",
-                )
-            log("[AUDIO] Track states: ${states.joinToString(", ")}")
+            val slot = phoneCallSlot ?: run {
+                log("[PHONECALL_STOP] phoneCallSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[PHONECALL_STOP] pause/flush failed: ${e.message}")
+                    }
+                    log("[PHONECALL_STOP] Phone-call track paused+flushed")
+                } else {
+                    log("[PHONECALL_STOP] Track not playing (state=${track.playState}), skipping pause")
+                }
+            }
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
         }
     }
 
-    /**
-     * Stop playback and release all resources.
-     */
+    /** Stop playback and release all resources. */
     fun release() {
         synchronized(lock) {
             log("[AUDIO] Releasing DualStreamAudioManager")
 
             isRunning.set(false)
 
-            // Stop playback thread
             playbackThread?.interrupt()
             try {
                 playbackThread?.join(1000)
-            } catch (e: InterruptedException) {
-                // Ignore
+            } catch (_: InterruptedException) {
             }
             playbackThread = null
 
-            // Release all audio tracks
-            releaseMediaTrack()
-            releaseNavTrack()
-            releaseVoiceTrack()
-            releaseCallTrack()
+            releaseSlot(mediaSlot)
+            releaseSlot(siriSlot)
+            releaseSlot(phoneCallSlot)
+            releaseSlot(alertSlot)
+            mediaSlot = null
+            siriSlot = null
+            phoneCallSlot = null
+            alertSlot = null
 
-            // Clear all buffers
-            mediaBuffer?.clear()
+            releaseNavTrack()
+
+            // Abandon all AudioFocus requests
+            for ((purpose, request) in activeFocusRequests) {
+                systemAudioManager.abandonAudioFocusRequest(request)
+                logDebug("[AUDIO_FOCUS] Abandon $purpose (release)")
+            }
+            activeFocusRequests.clear()
+            focusListeners.clear()
+
             navBuffer?.clear()
-            voiceBuffer?.clear()
-            callBuffer?.clear()
-            mediaBuffer = null
             navBuffer = null
-            voiceBuffer = null
-            callBuffer = null
 
             log("[AUDIO] DualStreamAudioManager released")
         }
@@ -943,39 +787,117 @@ class DualStreamAudioManager(
 
     // ========== Private Methods ==========
 
-    private fun ensureMediaTrack(decodeType: Int) {
-        val format = AudioFormats.fromDecodeType(decodeType)
+    /** Create a pre-allocated purpose slot with AudioTrack + ring buffer. */
+    private fun createPurposeSlot(
+        purpose: StreamPurpose,
+        format: AudioFormatConfig,
+    ): PurposeSlot {
+        val buffer =
+            AudioRingBuffer(
+                capacityMs = audioConfig.mediaBufferCapacityMs,
+                sampleRate = format.sampleRate,
+                channels = format.channelCount,
+            )
+        val chunkSize = format.sampleRate * format.channelCount * 2 * 5 / 1000
+        val track = createAudioTrack(format, purpose)
+        log(
+            "[AUDIO_TRACK] Pre-allocated $purpose track: ${format.sampleRate}Hz " +
+                "${format.channelCount}ch id=${track?.audioSessionId}",
+        )
+        return PurposeSlot(
+            format = format,
+            purpose = purpose,
+            track = track,
+            buffer = buffer,
+            tempBuffer = ByteArray(chunkSize * 20),
+        )
+    }
+
+    /**
+     * Two-factor routing: state flags + format match → pre-allocated slot.
+     *
+     * During transitions (e.g., SIRI_START sent but adapter still sending media PCM),
+     * the format won't match the target purpose, so media PCM stays on the MEDIA track.
+     */
+    private fun resolveTargetSlot(
+        format: AudioFormatConfig,
+        state: AudioRoutingState,
+    ): PurposeSlot? {
+        // 8kHz = AA phone calls (HFP/SCO narrowband), 16kHz = CarPlay phone calls (iAP2 wideband)
+        val slot =
+            if (state.isPhoneCallActive && (format.sampleRate == 8000 || format.sampleRate == 16000) && format.channelCount == 1) {
+                phoneCallSlot
+            } else if (state.isSiriActive && format.sampleRate == 16000 && format.channelCount == 1) {
+                siriSlot
+            } else if (state.isAlertActive) {
+                alertSlot // Format-agnostic: ensureSlotFormat() handles 48kHz/2ch (CarPlay) or 24kHz/1ch (AA)
+            } else {
+                mediaSlot // Default: all other audio (including transition-period media)
+            }
+        val purpose = slot?.purpose
+        if (purpose != lastRoutePurpose || format.sampleRate != lastRouteSampleRate || format.channelCount != lastRouteChannels) {
+            if (routeRepeatCount > 0) {
+                logDebug("[AUDIO_ROUTE] (suppressed $routeRepeatCount identical)")
+            }
+            logDebug(
+                "[AUDIO_ROUTE] ${format.sampleRate}Hz/${format.channelCount}ch " +
+                    "state=(call=${state.isPhoneCallActive} siri=${state.isSiriActive} alert=${state.isAlertActive}) " +
+                    "→ ${purpose ?: "null"}",
+            )
+            lastRoutePurpose = purpose
+            lastRouteSampleRate = format.sampleRate
+            lastRouteChannels = format.channelCount
+            routeRepeatCount = 0
+        } else {
+            routeRepeatCount++
+        }
+        return slot
+    }
+
+    /** Ensure slot's AudioTrack matches incoming format; recreate if different (rare). */
+    private fun ensureSlotFormat(
+        slot: PurposeSlot,
+        incomingFormat: AudioFormatConfig,
+    ) {
+        if (slot.format == incomingFormat && slot.track != null) return
 
         synchronized(lock) {
-            // Resume paused track if same format (Fix for Siri tone not heard after first invocation)
-            mediaTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PAUSED && mediaFormat == format) {
-                    track.play()
-                    mediaStarted = false // Reset pre-fill for smooth resume
-                    log("[AUDIO] Resumed paused media track (same format ${format.sampleRate}Hz)")
-                    return
+            // Double-check under lock
+            if (slot.format == incomingFormat && slot.track != null) return
+
+            if (slot.format != incomingFormat) {
+                // Format change: recreate track + buffer
+                try {
+                    slot.track?.let { track ->
+                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
+                        track.release()
+                    }
+                } catch (_: Exception) {
                 }
-            }
 
-            // Check if format changed
-            if (mediaFormat != format) {
-                log("[AUDIO] Media format change: ${mediaFormat?.sampleRate ?: 0}Hz -> ${format.sampleRate}Hz")
-                releaseMediaTrack()
-                mediaFormat = format
-
-                // Create new ring buffer for this format
-                // 500ms buffer absorbs USB packet jitter (gaps up to 1200ms observed)
-                mediaBuffer =
+                slot.format = incomingFormat
+                slot.buffer =
                     AudioRingBuffer(
-                        capacityMs = 500,
-                        sampleRate = format.sampleRate,
-                        channels = format.channelCount,
+                        capacityMs = audioConfig.mediaBufferCapacityMs,
+                        sampleRate = incomingFormat.sampleRate,
+                        channels = incomingFormat.channelCount,
                     )
-
-                // Create AudioTrack with USAGE_MEDIA → CarAudioContext.MUSIC
-                mediaTrack = createAudioTrack(format, AudioStreamType.MEDIA)
-                mediaTrack?.play()
-                AudioDebugLogger.logStreamStart("MEDIA", format.sampleRate, format.channelCount, 500)
+                val chunkSize = incomingFormat.sampleRate * incomingFormat.channelCount * 2 * 5 / 1000
+                slot.tempBuffer = ByteArray(chunkSize * 20)
+                slot.track = createAudioTrack(incomingFormat, slot.purpose)
+                slot.started = false
+                slot.pendingPlay = true
+                slot.residualCount = 0
+                log(
+                    "[AUDIO] Recreated ${slot.purpose} track for format change: " +
+                        "${incomingFormat.sampleRate}Hz ${incomingFormat.channelCount}ch",
+                )
+            } else {
+                // Same format but dead track (ERROR_DEAD_OBJECT recovery)
+                slot.track = createAudioTrack(incomingFormat, slot.purpose)
+                slot.started = false
+                slot.pendingPlay = true
+                log("[AUDIO] Recreated dead ${slot.purpose} track: ${incomingFormat.sampleRate}Hz")
             }
         }
     }
@@ -984,139 +906,63 @@ class DualStreamAudioManager(
         val format = AudioFormats.fromDecodeType(decodeType)
 
         synchronized(lock) {
-            // Reset stopped state - new nav session starting
             navStopped = false
 
-            // Resume paused track if same format
+            // Resume paused track with flush (secondary to end marker flush)
             navTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PAUSED && navFormat == format) {
-                    // Flush any residual data before resuming (belt-and-suspenders with end marker flush)
+                if (track.playState == AudioTrack.PLAYSTATE_PAUSED && navFormat == format && !navPendingPlay) {
                     val discardedMs = navBuffer?.fillLevelMs() ?: 0
                     track.flush()
                     navBuffer?.clear()
-                    track.play()
-                    navStarted = false // Reset pre-fill for smooth resume
-                    navStartTime = System.currentTimeMillis() // Track start time for min duration
-                    AudioDebugLogger.logNavBufferFlush("track_resume", discardedMs)
-                    AudioDebugLogger.logNavPromptStart(format.sampleRate, format.channelCount, 200)
-                    log("[AUDIO] Resumed paused nav track with flush (same format ${format.sampleRate}Hz)")
+                    navPendingPlay = true
+                    navStarted = false
+                    navStartTime = System.currentTimeMillis()
+                    // Request nav focus on resume
+                    onPurposeChanged(StreamPurpose.NAVIGATION)
+                    log("[AUDIO] Resumed paused nav track with flush — discarded=${discardedMs}ms (same format ${format.sampleRate}Hz)")
                     return
                 }
             }
 
-            // Check if format changed
             if (navFormat != format) {
                 log("[AUDIO] Nav format change: ${navFormat?.sampleRate ?: 0}Hz -> ${format.sampleRate}Hz")
                 releaseNavTrack()
                 navFormat = format
 
-                // Create new ring buffer for this format
-                // 200ms buffer for navigation prompts (lower latency than media)
                 navBuffer =
                     AudioRingBuffer(
-                        capacityMs = 200,
+                        capacityMs = audioConfig.navBufferCapacityMs,
                         sampleRate = format.sampleRate,
                         channels = format.channelCount,
                     )
 
-                // Create AudioTrack with USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → CarAudioContext.NAVIGATION
-                navTrack = createAudioTrack(format, AudioStreamType.NAVIGATION)
-                navTrack?.play()
+                navTrack = createAudioTrack(format, StreamPurpose.NAVIGATION)
+                navPendingPlay = true
                 navStartTime = System.currentTimeMillis() // Track start time for min duration
-                AudioDebugLogger.logStreamStart("NAV", format.sampleRate, format.channelCount, 200)
-                AudioDebugLogger.logNavPromptStart(format.sampleRate, format.channelCount, 200)
-            }
-        }
-    }
-
-    private fun ensureVoiceTrack(decodeType: Int) {
-        val format = AudioFormats.fromDecodeType(decodeType)
-
-        synchronized(lock) {
-            // Resume paused track if same format (critical for Siri tone on subsequent invocations)
-            voiceTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PAUSED && voiceFormat == format) {
-                    track.play()
-                    voiceStarted = false // Reset pre-fill for smooth resume
-                    voiceStartTime = System.currentTimeMillis() // Track start time for min duration
-                    log("[AUDIO] Resumed paused voice track (same format ${format.sampleRate}Hz)")
-                    return
-                }
-            }
-
-            // Check if format changed
-            if (voiceFormat != format) {
-                log("[AUDIO] Voice format change: ${voiceFormat?.sampleRate ?: 0}Hz -> ${format.sampleRate}Hz")
-                releaseVoiceTrack()
-                voiceFormat = format
-
-                // Create new ring buffer for this format
-                // 250ms buffer for voice assistant responses
-                voiceBuffer =
-                    AudioRingBuffer(
-                        capacityMs = 250,
-                        sampleRate = format.sampleRate,
-                        channels = format.channelCount,
-                    )
-
-                // Create AudioTrack with USAGE_ASSISTANT → CarAudioContext.VOICE_COMMAND
-                voiceTrack = createAudioTrack(format, AudioStreamType.SIRI)
-                voiceTrack?.play()
-                voiceStartTime = System.currentTimeMillis() // Track start time for min duration
-                AudioDebugLogger.logStreamStart("VOICE", format.sampleRate, format.channelCount, 250)
-            }
-        }
-    }
-
-    private fun ensureCallTrack(decodeType: Int) {
-        val format = AudioFormats.fromDecodeType(decodeType)
-
-        synchronized(lock) {
-            // Resume paused track if same format
-            callTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PAUSED && callFormat == format) {
-                    track.play()
-                    callStarted = false // Reset pre-fill for smooth resume
-                    log("[AUDIO] Resumed paused call track (same format ${format.sampleRate}Hz)")
-                    return
-                }
-            }
-
-            // Check if format changed
-            if (callFormat != format) {
-                log("[AUDIO] Call format change: ${callFormat?.sampleRate ?: 0}Hz -> ${format.sampleRate}Hz")
-                releaseCallTrack()
-                callFormat = format
-
-                // Create new ring buffer for this format
-                // 250ms buffer for phone call audio
-                callBuffer =
-                    AudioRingBuffer(
-                        capacityMs = 250,
-                        sampleRate = format.sampleRate,
-                        channels = format.channelCount,
-                    )
-
-                // Create AudioTrack with USAGE_VOICE_COMMUNICATION → CarAudioContext.CALL
-                callTrack = createAudioTrack(format, AudioStreamType.PHONE_CALL)
-                callTrack?.play()
-                AudioDebugLogger.logStreamStart("CALL", format.sampleRate, format.channelCount, 250)
+                // Request nav focus on new track creation
+                onPurposeChanged(StreamPurpose.NAVIGATION)
             }
         }
     }
 
     /**
-     * Create an AudioTrack with the appropriate USAGE constant for AAOS CarAudioContext mapping.
+     * Create an AudioTrack with per-purpose AudioAttributes for AAOS CarAudioContext mapping.
      *
-     * AAOS CarAudioContext Mapping:
-     * - USAGE_MEDIA (1) → MUSIC context
-     * - USAGE_ASSISTANCE_NAVIGATION_GUIDANCE (12) → NAVIGATION context
-     * - USAGE_ASSISTANT (16) → VOICE_COMMAND context
-     * - USAGE_VOICE_COMMUNICATION (2) → CALL context
+     * AAOS CarAudioContext Mapping (this file's actual emissions):
+     * - MEDIA        → USAGE_MEDIA                          → MUSIC context
+     * - PHONE_CALL   → USAGE_VOICE_COMMUNICATION            → CALL context
+     * - SIRI         → USAGE_ASSISTANT                      → VOICE_COMMAND context
+     * - ALERT        → USAGE_VOICE_COMMUNICATION_SIGNALLING → CALL_RING (intended; GM-specific)
+     * - NAVIGATION   → USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION context
+     *
+     * The ALERT mapping is a deliberate GM-AAOS workaround (not the AOSP default of
+     * USAGE_NOTIFICATION_RINGTONE → CALL_RING). See [purposeToAttributes] for the
+     * rationale and `documents/reference/gminfo/audio/audio_subsystem.md` for the
+     * authoritative GM volume-group / bus-routing tables.
      */
     private fun createAudioTrack(
         format: AudioFormatConfig,
-        streamType: Int,
+        purpose: StreamPurpose,
     ): AudioTrack? {
         try {
             val minBufferSize =
@@ -1131,56 +977,9 @@ class DualStreamAudioManager(
                 return null
             }
 
-            // Use larger buffer for jitter tolerance
             val bufferSize = minBufferSize * bufferMultiplier
 
-            // Select AudioAttributes based on stream type for proper AAOS CarAudioContext routing
-            val (usage, contentType, streamName) =
-                when (streamType) {
-                    // USAGE_MEDIA → CarAudioContext.MUSIC
-                    AudioStreamType.MEDIA -> {
-                        Triple(
-                            AudioAttributes.USAGE_MEDIA,
-                            AudioAttributes.CONTENT_TYPE_MUSIC,
-                            "MEDIA",
-                        )
-                    }
-
-                    // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → CarAudioContext.NAVIGATION
-                    AudioStreamType.NAVIGATION -> {
-                        Triple(
-                            AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE,
-                            AudioAttributes.CONTENT_TYPE_SPEECH,
-                            "NAV",
-                        )
-                    }
-
-                    // USAGE_ASSISTANT → CarAudioContext.VOICE_COMMAND
-                    AudioStreamType.SIRI -> {
-                        Triple(
-                            AudioAttributes.USAGE_ASSISTANT,
-                            AudioAttributes.CONTENT_TYPE_SPEECH,
-                            "VOICE",
-                        )
-                    }
-
-                    // USAGE_VOICE_COMMUNICATION → CarAudioContext.CALL
-                    AudioStreamType.PHONE_CALL -> {
-                        Triple(
-                            AudioAttributes.USAGE_VOICE_COMMUNICATION,
-                            AudioAttributes.CONTENT_TYPE_SPEECH,
-                            "CALL",
-                        )
-                    }
-
-                    else -> {
-                        Triple(
-                            AudioAttributes.USAGE_MEDIA,
-                            AudioAttributes.CONTENT_TYPE_MUSIC,
-                            "UNKNOWN",
-                        )
-                    }
-                }
+            val (usage, contentType) = purposeToAttributes(purpose)
 
             val audioAttributes =
                 AudioAttributes
@@ -1197,9 +996,7 @@ class DualStreamAudioManager(
                     .setEncoding(format.encoding)
                     .build()
 
-            // Performance mode is platform-specific:
-            // - DEFAULT: PERFORMANCE_MODE_LOW_LATENCY (requests FAST track)
-            // - GM AAOS: PERFORMANCE_MODE_NONE (FAST track denied anyway)
+            // Performance mode: LOW_LATENCY (default) or NONE (GM AAOS)
             val track =
                 AudioTrack
                     .Builder()
@@ -1210,20 +1007,17 @@ class DualStreamAudioManager(
                     .setPerformanceMode(audioConfig.performanceMode)
                     .build()
 
-            // Set initial volume based on stream type
             val volume =
-                when (streamType) {
-                    AudioStreamType.MEDIA -> if (isDucked) mediaVolume * duckLevel else mediaVolume
-                    AudioStreamType.NAVIGATION -> navVolume
-                    AudioStreamType.SIRI -> voiceVolume
-                    AudioStreamType.PHONE_CALL -> callVolume
-                    else -> 1.0f
+                when (purpose) {
+                    StreamPurpose.NAVIGATION -> navVolume
+                    StreamPurpose.MEDIA -> mediaVolume * minOf(if (isDucked) duckLevel else 1.0f, focusDuckLevel)
+                    else -> 1.0f // Non-media purpose slots stay at full volume
                 }
             track.setVolume(volume)
 
             log(
-                "[AUDIO] Created $streamName AudioTrack: ${format.sampleRate}Hz " +
-                    "${format.channelCount}ch buffer=${bufferSize}B usage=$usage",
+                "[AUDIO] Created $purpose AudioTrack: ${format.sampleRate}Hz " +
+                    "${format.channelCount}ch buffer=${bufferSize}B usage=$usage id=${track.audioSessionId}",
             )
 
             return track
@@ -1233,27 +1027,33 @@ class DualStreamAudioManager(
         }
     }
 
-    private fun releaseMediaTrack() {
+    private fun releaseSlot(slot: PurposeSlot?) {
+        slot ?: return
         try {
-            mediaTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.stop()
+            slot.track?.let { track ->
+                try {
+                    if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                        track.stop()
+                    }
+                } catch (e: Exception) {
+                    log("[AUDIO] WARN: Failed to stop ${slot.purpose} track: ${e.message}")
                 }
                 track.release()
             }
         } catch (e: Exception) {
-            log("[AUDIO] ERROR: Failed to release media track: ${e.message}")
+            log("[AUDIO] ERROR: Failed to release ${slot.purpose} track: ${e.message}")
         }
-        mediaTrack = null
-        mediaFormat = null
-        mediaStarted = false // Reset pre-fill flag for next track
+        slot.buffer.clear()
+        slot.track = null
     }
 
     private fun releaseNavTrack() {
         try {
             navTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.stop()
+                try {
+                    if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.stop()
+                } catch (e: Exception) {
+                    log("[AUDIO] WARN: Failed to stop nav track: ${e.message}")
                 }
                 track.release()
             }
@@ -1262,66 +1062,36 @@ class DualStreamAudioManager(
         }
         navTrack = null
         navFormat = null
-        navStarted = false // Reset pre-fill flag for next track
-    }
-
-    private fun releaseVoiceTrack() {
-        try {
-            voiceTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.stop()
-                }
-                track.release()
-            }
-        } catch (e: Exception) {
-            log("[AUDIO] ERROR: Failed to release voice track: ${e.message}")
-        }
-        voiceTrack = null
-        voiceFormat = null
-        voiceStarted = false // Reset pre-fill flag for next track
-    }
-
-    private fun releaseCallTrack() {
-        try {
-            callTrack?.let { track ->
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.stop()
-                }
-                track.release()
-            }
-        } catch (e: Exception) {
-            log("[AUDIO] ERROR: Failed to release call track: ${e.message}")
-        }
-        callTrack = null
-        callFormat = null
-        callStarted = false // Reset pre-fill flag for next track
+        navStarted = false
+        navPendingPlay = false
     }
 
     private fun log(message: String) {
-        if (BuildConfig.DEBUG) {
-            Log.d(TAG, message)
-        }
-        logCallback.log(message)
+        logCallback.log("AUDIO", message)
     }
 
-    /**
-     * Dedicated audio playback thread.
-     *
-     * Runs at THREAD_PRIORITY_URGENT_AUDIO for consistent scheduling.
-     * Reads from ring buffers and writes to AudioTracks.
-     *
-     * Each stream has its own tempBuffer to prevent any potential data corruption
-     * when multiple streams are active simultaneously (e.g., nav during music).
-     */
+    private fun logPerf(message: String) {
+        logCallback.logPerf("AUDIO_PERF", message)
+    }
+
+    private fun logDebug(message: String) {
+        logCallback.log("AUDIO_DEBUG", message)
+    }
+
+    /** Playback thread (URGENT_AUDIO priority). Separate buffers per stream for safety. */
     private inner class AudioPlaybackThread : Thread("AudioPlayback") {
-        // Separate buffers per stream to prevent data corruption during interleaved playback
-        private val mediaTempBuffer = ByteArray(playbackChunkSize)
-        private val navTempBuffer = ByteArray(playbackChunkSize)
-        private val voiceTempBuffer = ByteArray(playbackChunkSize)
-        private val callTempBuffer = ByteArray(playbackChunkSize)
+        // Nav temp buffer (sized for max nav format: 48kHz stereo, 100ms bulk)
+        private val navTempBuffer = ByteArray(audioConfig.sampleRate * 2 * 2 / 10)
+
+        // Pre-allocated silence for MEDIA idle-fill (10ms at 48kHz/stereo/16bit = 1920 bytes).
+        // Keeps AudioTrack PLAYING to avoid AudioFlinger state-transition overhead.
+        private val silenceBuffer = ByteArray(1920)
+
+        // Residual tracking for nav partial WRITE_NON_BLOCKING returns
+        private var navResidualOffset = 0
+        private var navResidualCount = 0
 
         override fun run() {
-            // Set high priority for audio thread
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             log("[AUDIO] Playback thread started with URGENT_AUDIO priority")
 
@@ -1329,128 +1099,277 @@ class DualStreamAudioManager(
                 try {
                     var didWork = false
 
-                    // Process media buffer
-                    mediaBuffer?.let { buffer ->
-                        mediaTrack?.let { track ->
-                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                                // Get current buffer fill level
-                                val currentFillMs = buffer.fillLevelMs()
+                    // === Process all pre-allocated purpose slots ===
+                    val slotsSnapshot = listOfNotNull(mediaSlot, siriSlot, phoneCallSlot, alertSlot)
 
-                                // Pre-fill check: wait for minimum buffer level before first playback
-                                if (!mediaStarted) {
-                                    if (currentFillMs < prefillThresholdMs) {
-                                        // Not enough data yet, skip this iteration
-                                        return@let
-                                    }
-                                    mediaStarted = true
-                                    log("[AUDIO] Media pre-fill complete: ${currentFillMs}ms buffered, starting playback")
-                                }
+                    for (slot in slotsSnapshot) {
+                        val track = slot.track ?: continue
+                        if (track.playState != AudioTrack.PLAYSTATE_PLAYING && !slot.pendingPlay) {
+                            continue
+                        }
 
-                                // Enforce minimum buffer level during playback
-                                // This prevents draining the buffer to 0ms which causes constant underruns
-                                if (currentFillMs <= minBufferLevelMs) {
-                                    // Buffer too low - let it build up before reading more
-                                    // This maintains headroom for USB timing jitter
-                                    return@let
-                                }
+                        val buffer = slot.buffer
+                        val currentFillMs = buffer.fillLevelMs()
 
-                                val available = buffer.availableForRead()
-                                if (available > 0) {
-                                    // Calculate how much we can read while maintaining minimum buffer level
-                                    val bytesPerMs =
-                                        (mediaFormat?.sampleRate ?: audioConfig.sampleRate) * (mediaFormat?.channelCount ?: 2) * 2 / 1000
-                                    val maxReadableMs = currentFillMs - minBufferLevelMs
-                                    val maxReadableBytes = maxReadableMs * bytesPerMs
-                                    val toRead = minOf(available, playbackChunkSize, maxReadableBytes.coerceAtLeast(0))
-
-                                    if (toRead > 0) {
-                                        val bytesRead = buffer.read(mediaTempBuffer, 0, toRead)
-                                        if (bytesRead > 0) {
-                                            // Use WRITE_NON_BLOCKING to avoid blocking the playback thread
-                                            // This allows better pacing and prevents starvation
-                                            val written =
-                                                track.write(
-                                                    mediaTempBuffer,
-                                                    0,
-                                                    bytesRead,
-                                                    AudioTrack.WRITE_NON_BLOCKING,
-                                                )
-                                            if (written < 0) {
-                                                handleTrackError("MEDIA", written)
-                                            } else if (written < bytesRead) {
-                                                // AudioTrack buffer is full, couldn't write all data
-                                                // This is normal with non-blocking - data stays in ring buffer
-                                                // We'll try again next iteration
-                                            }
-                                            didWork = true
-                                        }
+                        // Pre-fill before first playback
+                        if (!slot.started) {
+                            if (currentFillMs < prefillThresholdMs) continue
+                            slot.started = true
+                            if (slot.pendingPlay) {
+                                while (buffer.fillLevelMs() > minBufferLevelMs) {
+                                    val avail = buffer.availableForRead()
+                                    if (avail <= 0) break
+                                    val bytesRead =
+                                        buffer.read(
+                                            slot.tempBuffer,
+                                            0,
+                                            minOf(avail, slot.tempBuffer.size),
+                                        )
+                                    if (bytesRead <= 0) break
+                                    val written =
+                                        track.write(
+                                            slot.tempBuffer,
+                                            0,
+                                            bytesRead,
+                                            AudioTrack.WRITE_NON_BLOCKING,
+                                        )
+                                    if (written <= 0) break
+                                    windowMediaPlayed.addAndGet(written.toLong())
+                                    if (written < bytesRead) {
+                                        slot.residualOffset = written
+                                        slot.residualCount = bytesRead - written
+                                        break
                                     }
                                 }
+                                track.play()
+                                slot.pendingPlay = false
+                                slot.underruns = track.underrunCount
+                            }
+                            log(
+                                "[AUDIO] ${slot.purpose} pre-fill complete " +
+                                    "(${slot.format.sampleRate}Hz/${slot.format.channelCount}ch): " +
+                                    "${currentFillMs}ms buffered, starting playback",
+                            )
+                        }
 
-                                // Check for underruns and trigger recovery if needed
-                                val underruns = track.underrunCount
-                                if (underruns > mediaUnderruns) {
-                                    val newUnderruns = underruns - mediaUnderruns
-                                    mediaUnderruns = underruns
-                                    AudioDebugLogger.logTrackUnderrun("MEDIA", underruns)
-                                    log(
-                                        "[AUDIO_UNDERRUN] Media underrun detected: " +
-                                            "+$newUnderruns (total: $underruns)",
-                                    )
+                        // Retry residual from prior partial WRITE_NON_BLOCKING
+                        if (slot.residualCount > 0) {
+                            val written =
+                                track.write(
+                                    slot.tempBuffer,
+                                    slot.residualOffset,
+                                    slot.residualCount,
+                                    AudioTrack.WRITE_NON_BLOCKING,
+                                )
+                            if (written < 0) {
+                                slot.residualCount = 0
+                                handleTrackError(slot.purpose.name, written, slot)
+                                continue
+                            }
+                            if (written > 0) {
+                                windowMediaPlayed.addAndGet(written.toLong())
+                                slot.residualOffset += written
+                                slot.residualCount -= written
+                                didWork = true
+                            }
+                        }
 
-                                    // Recovery: If many underruns and buffer critically low, reset pre-fill
-                                    if (newUnderruns >= underrunRecoveryThreshold && buffer.fillLevelMs() < 50) {
-                                        // Force pre-fill again
-                                        mediaStarted = false
-                                        log(
-                                            "[AUDIO_RECOVERY] Resetting media pre-fill due to " +
-                                                "$newUnderruns underruns, buffer=${buffer.fillLevelMs()}ms",
+                        // Skip new reads while residual pending or buffer empty
+                        if (slot.residualCount > 0 || currentFillMs <= minBufferLevelMs) {
+                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
+                                currentFillMs <= minBufferLevelMs && slot.residualCount == 0
+                            ) {
+                                val now = System.currentTimeMillis()
+                                if (slot.idleSince == 0L) {
+                                    slot.idleSince = now
+                                } else if (now - slot.idleSince >= idlePauseMs) {
+                                    if (slot.purpose == StreamPurpose.MEDIA ||
+                                        slot.purpose == StreamPurpose.PHONE_CALL ||
+                                        slot.purpose == StreamPurpose.SIRI
+                                    ) {
+                                        // MEDIA, PHONE_CALL, SIRI: write silence to keep AudioTrack
+                                        // PLAYING. These streams have natural inter-packet gaps
+                                        // (VAD/silence frames in calls; inter-utterance pauses in
+                                        // Siri/Assistant TTS) that would otherwise trigger
+                                        // pause/resume churn — releasing the volume context to
+                                        // AAOS and causing volume keys to flap to MEDIA mid-session.
+                                        // Their lifecycle is gated by explicit STOP commands
+                                        // (AUDIO_PHONECALL_STOP / AUDIO_SIRI_STOP) which call
+                                        // stopPhoneCallTrack() / stopSiriTrack() to release the
+                                        // volume context — not by buffer drain.
+                                        track.write(
+                                            silenceBuffer,
+                                            0,
+                                            silenceBuffer.size,
+                                            AudioTrack.WRITE_NON_BLOCKING,
+                                        )
+                                    } else {
+                                        // ALERT: pause to release AAOS volume context.
+                                        // Short bursts with defined start/end signals.
+                                        track.pause()
+                                        slot.started = false
+                                        slot.idleSince = 0
+                                        logDebug(
+                                            "[AUDIO] ${slot.purpose} idle-paused " +
+                                                "(no data for ${idlePauseMs}ms)",
                                         )
                                     }
                                 }
+                            } else {
+                                slot.idleSince = 0
+                            }
+                            continue
+                        }
+
+                        val available = buffer.availableForRead()
+                        if (available > 0) {
+                            val bytesPerMs =
+                                slot.format.sampleRate * slot.format.channelCount * 2 / 1000
+                            val maxReadableMs = currentFillMs - minBufferLevelMs
+                            val maxReadableBytes = maxReadableMs * bytesPerMs
+                            val toRead =
+                                minOf(
+                                    available,
+                                    slot.tempBuffer.size,
+                                    maxReadableBytes.coerceAtLeast(0),
+                                )
+
+                            if (toRead > 0) {
+                                val bytesRead = buffer.read(slot.tempBuffer, 0, toRead)
+                                if (bytesRead > 0) {
+                                    val written =
+                                        track.write(
+                                            slot.tempBuffer,
+                                            0,
+                                            bytesRead,
+                                            AudioTrack.WRITE_NON_BLOCKING,
+                                        )
+                                    if (written < 0) {
+                                        handleTrackError(slot.purpose.name, written, slot)
+                                        continue
+                                    }
+                                    if (written > 0) {
+                                        windowMediaPlayed.addAndGet(written.toLong())
+                                    }
+                                    if (written < bytesRead) {
+                                        slot.residualOffset = written
+                                        slot.residualCount = bytesRead - written
+                                        windowMediaResiduals.incrementAndGet()
+                                    }
+                                    if (written > 0) didWork = true
+                                }
+                            }
+                        }
+
+                        // Underrun detection
+                        val underruns = track.underrunCount
+                        if (underruns > slot.underruns) {
+                            val newUnderruns = underruns - slot.underruns
+                            slot.underruns = underruns
+                            log(
+                                "[AUDIO_UNDERRUN] ${slot.purpose} underrun " +
+                                    "(${slot.format.sampleRate}Hz): +$newUnderruns (total: $underruns)",
+                            )
+                            if (newUnderruns >= underrunRecoveryThreshold && buffer.fillLevelMs() < 50) {
+                                slot.started = false
+                                log(
+                                    "[AUDIO_RECOVERY] Resetting ${slot.purpose} pre-fill " +
+                                        "(${slot.format.sampleRate}Hz): $newUnderruns underruns, " +
+                                        "buffer=${buffer.fillLevelMs()}ms",
+                                )
                             }
                         }
                     }
 
-                    // Process navigation buffer
+                    // === Navigation: single track ===
                     navBuffer?.let { buffer ->
                         navTrack?.let { track ->
-                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                                // Get current buffer fill level
+                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING || navPendingPlay) {
                                 val currentNavFillMs = buffer.fillLevelMs()
 
-                                // Pre-fill check for navigation (shorter threshold for lower latency)
+                                // Shorter pre-fill for nav (lower latency)
                                 if (!navStarted) {
-                                    if (currentNavFillMs < prefillThresholdMs / 2) {
-                                        return@let
-                                    }
+                                    if (currentNavFillMs < prefillThresholdMs / 2) return@let
                                     navStarted = true
-                                    val waitTimeMs = System.currentTimeMillis() - navStartTime
-                                    AudioDebugLogger.logNavPrefillComplete(currentNavFillMs, waitTimeMs)
-                                    log("[AUDIO] Nav pre-fill complete: ${currentNavFillMs}ms buffered, starting playback")
+                                    if (navPendingPlay) {
+                                        // Pre-load AudioTrack buffer while STOPPED/PAUSED
+                                        // before play() so AudioFlinger finds data on first pull
+                                        val navMinBuf = minBufferLevelMs / 2
+                                        var preloaded = 0
+                                        while (buffer.fillLevelMs() > navMinBuf) {
+                                            val avail = buffer.availableForRead()
+                                            if (avail <= 0) break
+                                            val bytesRead =
+                                                buffer.read(
+                                                    navTempBuffer,
+                                                    0,
+                                                    minOf(avail, navTempBuffer.size),
+                                                )
+                                            if (bytesRead <= 0) break
+                                            val written =
+                                                track.write(
+                                                    navTempBuffer,
+                                                    0,
+                                                    bytesRead,
+                                                    AudioTrack.WRITE_NON_BLOCKING,
+                                                )
+                                            if (written <= 0) break
+                                            windowNavPlayed.addAndGet(written.toLong())
+                                            preloaded += written
+                                            if (written < bytesRead) {
+                                                navResidualOffset = written
+                                                navResidualCount = bytesRead - written
+                                                break
+                                            }
+                                        }
+                                        track.play()
+                                        navPendingPlay = false
+                                        navUnderruns = track.underrunCount
+                                    }
+                                    log(
+                                        "[AUDIO] Nav pre-fill complete: " +
+                                            "${currentNavFillMs}ms buffered, starting playback",
+                                    )
                                 }
 
-                                // Enforce minimum buffer level during playback (use half for nav - lower latency)
-                                val navMinBufferMs = minBufferLevelMs / 2
-                                if (currentNavFillMs <= navMinBufferMs) {
-                                    // Buffer too low - let it build up
-                                    return@let
+                                // Retry residual from prior partial WRITE_NON_BLOCKING
+                                if (navResidualCount > 0) {
+                                    val written =
+                                        track.write(
+                                            navTempBuffer,
+                                            navResidualOffset,
+                                            navResidualCount,
+                                            AudioTrack.WRITE_NON_BLOCKING,
+                                        )
+                                    if (written < 0) {
+                                        navResidualCount = 0
+                                        handleTrackError("NAV", written)
+                                        return@let
+                                    }
+                                    if (written > 0) {
+                                        navResidualOffset += written
+                                        navResidualCount -= written
+                                        windowNavPlayed.addAndGet(written.toLong())
+                                        didWork = true
+                                    }
                                 }
+
+                                val navMinBufferMs = minBufferLevelMs / 2
+                                // Also skip new reads while residual is pending (AudioTrack full)
+                                if (navResidualCount > 0 || currentNavFillMs <= navMinBufferMs) return@let
 
                                 val available = buffer.availableForRead()
                                 if (available > 0) {
-                                    // Calculate how much we can read while maintaining minimum buffer level
                                     val bytesPerMs =
-                                        (navFormat?.sampleRate ?: audioConfig.sampleRate) * (navFormat?.channelCount ?: 2) * 2 / 1000
+                                        (navFormat?.sampleRate ?: audioConfig.sampleRate) *
+                                            (navFormat?.channelCount ?: 2) * 2 / 1000
                                     val maxReadableMs = currentNavFillMs - navMinBufferMs
                                     val maxReadableBytes = maxReadableMs * bytesPerMs
-                                    val toRead = minOf(available, playbackChunkSize, maxReadableBytes.coerceAtLeast(0))
+                                    val toRead = minOf(available, navTempBuffer.size, maxReadableBytes.coerceAtLeast(0))
 
                                     if (toRead > 0) {
                                         val bytesRead = buffer.read(navTempBuffer, 0, toRead)
                                         if (bytesRead > 0) {
-                                            // Use WRITE_NON_BLOCKING to prevent thread starvation
-                                            // across multiple streams (media/nav/voice/call)
                                             val written =
                                                 track.write(
                                                     navTempBuffer,
@@ -1460,150 +1379,143 @@ class DualStreamAudioManager(
                                                 )
                                             if (written < 0) {
                                                 handleTrackError("NAV", written)
-                                            } else {
-                                                // Log nav track writes (throttled - only when buffer is low)
-                                                AudioDebugLogger.logNavTrackWrite(written, buffer.fillLevelMs())
+                                                return@let
                                             }
-                                            didWork = true
+                                            if (written > 0) {
+                                                windowNavPlayed.addAndGet(written.toLong())
+                                            }
+                                            if (written < bytesRead) {
+                                                navResidualOffset = written
+                                                navResidualCount = bytesRead - written
+                                                windowNavResiduals.incrementAndGet()
+                                            }
+                                            if (written > 0) didWork = true
                                         }
                                     }
                                 }
 
-                                // Check for underruns
                                 val underruns = track.underrunCount
                                 if (underruns > navUnderruns) {
                                     val newUnderruns = underruns - navUnderruns
                                     navUnderruns = underruns
-                                    AudioDebugLogger.logTrackUnderrun("NAV", underruns)
                                     log(
                                         "[AUDIO_UNDERRUN] Nav underrun detected: " +
                                             "+$newUnderruns (total: $underruns)",
                                     )
+
+                                    // Recovery: If many underruns and buffer critically low, reset pre-fill
+                                    if (newUnderruns >= underrunRecoveryThreshold && buffer.fillLevelMs() < 30) {
+                                        navStarted = false
+                                        log(
+                                            "[AUDIO_RECOVERY] Resetting nav pre-fill due to " +
+                                                "$newUnderruns underruns, buffer=${buffer.fillLevelMs()}ms",
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Process voice assistant buffer (USAGE_ASSISTANT → CarAudioContext.VOICE_COMMAND)
-                    voiceBuffer?.let { buffer ->
-                        voiceTrack?.let { track ->
-                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                                // Pre-fill check for voice assistant
-                                if (!voiceStarted) {
-                                    val fillMs = buffer.fillLevelMs()
-                                    if (fillMs < prefillThresholdMs / 2) {
-                                        return@let
-                                    }
-                                    voiceStarted = true
-                                    log("[AUDIO] Voice pre-fill complete: ${fillMs}ms buffered, starting playback")
-                                }
+                    // Pace every pass, not just idle ones. Each pass can already stage up
+                    // to ~100ms/slot (tempBuffer) into a 750ms ring + the AudioTrack buffer,
+                    // so a fixed 5ms cadence cannot underfeed at 1x realtime — it removes the
+                    // active-playback busy-spin (previously this only slept when fully idle).
+                    // NOTE: `didWork` is now vestigial (assigned but unread) — harmless.
+                    sleep(5)
 
-                                val available = buffer.availableForRead()
-                                if (available > 0) {
-                                    val toRead = minOf(available, playbackChunkSize)
-                                    val bytesRead = buffer.read(voiceTempBuffer, 0, toRead)
-                                    if (bytesRead > 0) {
-                                        // Use WRITE_NON_BLOCKING to prevent thread starvation
-                                        // across multiple streams (media/nav/voice/call)
-                                        val written =
-                                            track.write(
-                                                voiceTempBuffer,
-                                                0,
-                                                bytesRead,
-                                                AudioTrack.WRITE_NON_BLOCKING,
-                                            )
-                                        if (written < 0) {
-                                            handleTrackError("VOICE", written)
-                                        }
-                                        didWork = true
-                                    }
-                                }
+                    // 30s aggregate stats (gated by AUDIO_PERF tag)
+                    val now = System.currentTimeMillis()
+                    if (now - lastStatsTime >= statsInterval) {
+                        val mRx = windowMediaRx.getAndSet(0)
+                        val nRx = windowNavRx.getAndSet(0)
+                        val mPlay = windowMediaPlayed.getAndSet(0)
+                        val nPlay = windowNavPlayed.getAndSet(0)
+                        val mRes = windowMediaResiduals.getAndSet(0)
+                        val nRes = windowNavResiduals.getAndSet(0)
+                        val zf = windowZeroFiltered.getAndSet(0)
 
-                                // Check for underruns
-                                val underruns = track.underrunCount
-                                if (underruns > voiceUnderruns) {
-                                    val newUnderruns = underruns - voiceUnderruns
-                                    voiceUnderruns = underruns
-                                    AudioDebugLogger.logTrackUnderrun("VOICE", underruns)
-                                    log(
-                                        "[AUDIO_UNDERRUN] Voice underrun detected: " +
-                                            "+$newUnderruns (total: $underruns)",
-                                    )
+                        // Per-purpose slot stats
+                        var mOvf = 0
+                        var mUrun = 0
+                        val sb = StringBuilder()
+                        sb
+                            .append("Slots[Rx:")
+                            .append(mRx)
+                            .append(" Play:")
+                            .append(mPlay / 1024)
+                            .append("KB")
+
+                        for (slot in slotsSnapshot) {
+                            val fill = slot.buffer.fillLevelMs()
+                            val state =
+                                when (slot.track?.playState) {
+                                    AudioTrack.PLAYSTATE_PLAYING -> "PLAY"
+                                    AudioTrack.PLAYSTATE_PAUSED -> "PAUSE"
+                                    else -> "STOP"
                                 }
-                            }
+                            sb
+                                .append(" ")
+                                .append(slot.purpose.name.take(4))
+                                .append(":")
+                                .append(fill)
+                                .append("ms(")
+                                .append(state)
+                                .append(")")
+
+                            val ovfDelta = slot.buffer.overflowCount - slot.prevOverflow
+                            slot.prevOverflow = slot.buffer.overflowCount
+                            mOvf += ovfDelta
+
+                            val urunDelta = slot.underruns - slot.prevUnderruns
+                            slot.prevUnderruns = slot.underruns
+                            mUrun += urunDelta
                         }
+
+                        sb
+                            .append(" Ovf:")
+                            .append(mOvf)
+                            .append(" Urun:")
+                            .append(mUrun)
+                        if (mRes > 0) sb.append(" Res:").append(mRes)
+
+                        // Nav stats
+                        val nFill = navBuffer?.fillLevelMs() ?: 0
+                        val nOvf = (navBuffer?.overflowCount ?: 0) - prevNavOverflow
+                        val nUrun = navUnderruns - prevNavUnderruns
+                        prevNavOverflow = navBuffer?.overflowCount ?: 0
+                        prevNavUnderruns = navUnderruns
+
+                        sb
+                            .append("] Nav[Rx:")
+                            .append(nRx)
+                            .append(" Play:")
+                            .append(nPlay / 1024)
+                            .append("KB")
+                            .append(" Buf:")
+                            .append(nFill)
+                            .append("ms")
+                            .append(" Ovf:")
+                            .append(nOvf)
+                            .append(" Urun:")
+                            .append(nUrun)
+                        if (nRes > 0) sb.append(" Res:").append(nRes)
+                        sb.append("]")
+                        if (zf > 0) sb.append(" Zero:").append(zf)
+                        val suppressed = routeRepeatCount
+                        if (suppressed > 0) sb.append(" Route:").append(lastRoutePurpose?.name ?: "?").append("x").append(suppressed)
+                        routeRepeatCount = 0
+                        sb.append(" Duck:").append(if (isDucked) "Y" else "N")
+                        sb.append(" FDuck:").append((focusDuckLevel * 100).toInt()).append("%")
+                        val focusPurposes = activeFocusRequests.keys.joinToString(",")
+                        if (focusPurposes.isNotEmpty()) sb.append(" Focus:[").append(focusPurposes).append("]")
+
+                        logPerf(sb.toString())
+                        lastStatsTime = now
                     }
-
-                    // Process phone call buffer (USAGE_VOICE_COMMUNICATION → CarAudioContext.CALL)
-                    callBuffer?.let { buffer ->
-                        callTrack?.let { track ->
-                            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                                // Pre-fill check for phone calls
-                                if (!callStarted) {
-                                    val fillMs = buffer.fillLevelMs()
-                                    if (fillMs < prefillThresholdMs / 2) {
-                                        return@let
-                                    }
-                                    callStarted = true
-                                    log("[AUDIO] Call pre-fill complete: ${fillMs}ms buffered, starting playback")
-                                }
-
-                                val available = buffer.availableForRead()
-                                if (available > 0) {
-                                    val toRead = minOf(available, playbackChunkSize)
-                                    val bytesRead = buffer.read(callTempBuffer, 0, toRead)
-                                    if (bytesRead > 0) {
-                                        // Use WRITE_NON_BLOCKING to prevent thread starvation
-                                        // across multiple streams (media/nav/voice/call)
-                                        val written =
-                                            track.write(
-                                                callTempBuffer,
-                                                0,
-                                                bytesRead,
-                                                AudioTrack.WRITE_NON_BLOCKING,
-                                            )
-                                        if (written < 0) {
-                                            handleTrackError("CALL", written)
-                                        }
-                                        didWork = true
-                                    }
-                                }
-
-                                // Check for underruns
-                                val underruns = track.underrunCount
-                                if (underruns > callUnderruns) {
-                                    val newUnderruns = underruns - callUnderruns
-                                    callUnderruns = underruns
-                                    AudioDebugLogger.logTrackUnderrun("CALL", underruns)
-                                    log(
-                                        "[AUDIO_UNDERRUN] Call underrun detected: " +
-                                            "+$newUnderruns (total: $underruns)",
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // Small sleep if no work done to prevent busy-waiting
-                    if (!didWork) {
-                        sleep(5)
-                    }
-
-                    // Periodic performance logging
-                    AudioDebugLogger.logPerfSummary(
-                        mediaBuffer?.fillLevelMs() ?: 0,
-                        navBuffer?.fillLevelMs() ?: 0,
-                        voiceBuffer?.fillLevelMs() ?: 0,
-                        callBuffer?.fillLevelMs() ?: 0,
-                        mediaUnderruns,
-                        navUnderruns,
-                        voiceUnderruns,
-                        callUnderruns,
-                    )
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    Log.e(TAG, "[AUDIO] Playback thread error: ${e.message}")
+                    log("[AUDIO] Playback thread error: ${e.message}")
                 }
             }
 
@@ -1613,18 +1525,46 @@ class DualStreamAudioManager(
         private fun handleTrackError(
             streamType: String,
             errorCode: Int,
+            slot: PurposeSlot? = null,
         ) {
             when (errorCode) {
                 AudioTrack.ERROR_DEAD_OBJECT -> {
-                    Log.e(TAG, "[AUDIO] $streamType AudioTrack dead, needs reinitialization")
+                    log("[AUDIO] $streamType AudioTrack dead, releasing for recreation")
+                    synchronized(lock) {
+                        if (slot != null) {
+                            // Purpose slot: null track, recreated on next ensureSlotFormat()
+                            try {
+                                slot.track?.release()
+                            } catch (_: Exception) {
+                            }
+                            slot.track = null
+                            slot.started = false
+                            slot.pendingPlay = false
+                            slot.residualCount = 0
+                        } else {
+                            // NAV path
+                            when (streamType) {
+                                "NAV" -> {
+                                    try {
+                                        navTrack?.release()
+                                    } catch (_: Exception) {
+                                    }
+                                    navTrack = null
+                                    navFormat = null
+                                    navStarted = false
+                                    navPendingPlay = false
+                                }
+                            }
+                        }
+                    }
                 }
 
                 AudioTrack.ERROR_INVALID_OPERATION -> {
-                    Log.e(TAG, "[AUDIO] $streamType AudioTrack invalid operation")
+                    log("[AUDIO] $streamType AudioTrack invalid operation")
                 }
 
                 else -> {
-                    Log.e(TAG, "[AUDIO] $streamType AudioTrack write error: $errorCode")
+                    log("[AUDIO] $streamType AudioTrack write error: $errorCode")
                 }
             }
         }
