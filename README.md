@@ -20,10 +20,8 @@ This fork adds quality-of-life improvements, increased reliability on GM AAOS he
 **Work in Progress** – Builds are versioned in commit messages (e.g., Build 52).
 
 ## Improvements in This Fork
-- **Video Reliability**:
-  - Enhanced resume logic with additional/delayed keyframe requests to greatly reduce black screens when returning from background or Settings.
-  - Exposed "Reset Video Stream" for instant decoder recovery (no full USB reconnect needed).
-  - Improved lifecycle handling for surface invalidation and decoder stalls.
+- **Synced with upstream**: Includes all of lvalen91's work through upstream build 145 (synchronous H.264 decoder rewrite, resume/pixelation fixes, decoder size probe, Media3 MediaSession, instrument-cluster navigation, Android Auto portrait support, Android 10 support, and more). See [`documents/revisions.txt`](documents/revisions.txt) for the full list.
+- **Fork defaults**: OpenSourceEV branding and icons, Bluetooth audio by default, Android Auto enabled on every connection.
 - **Google Play Readiness**:
   - Harmonized package name, versioning, and build configuration.
   - Clean native-only codebase.
@@ -42,7 +40,7 @@ Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto for
 
 ## Requirements
 - Android Studio (latest, JDK 21+ recommended).
-- Android SDK: minSdk 32 (Android 12L), targetSdk 34 (Android 14).
+- Android SDK: minSdk 29 (Android 10), targetSdk 36.
 - Compatible hardware: Carlinkit CPC200-CCPA adapter + GM AAOS head unit (extensively tested on Intel-based systems).
 
 ## Important Notes for GM Vehicles
@@ -60,15 +58,14 @@ Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto for
 
 2. **Customize for Publishing** (Google Play Internal Testing):
    - Open `app/build.gradle.kts`.
-   - Update `defaultConfig`:
-     applicationId = "com.yourcompany.carlinknative"  // Unique package
-     versionCode = 52
-     versionName = "1.0.52"
+   - Change `ownerApplicationId` to your unique package (applicationId and the cluster icon authority follow it).
+   - Update `versionCode` / `versionName` in `defaultConfig`.
+   - Use the `playRelease` variant for Play uploads (`sideloadDebug` / `sideloadRelease` for direct APK installs).
    - Sign the release build with your keystore.
 
 3. **Build**:
    - Open in Android Studio → Sync Gradle.
-   - Build → Build Bundle(s) / APK(s) → `bundleRelease` or `assembleRelease`.
+   - Build → Build Bundle(s) / APK(s) → `bundlePlayRelease` or `assembleSideloadRelease`.
 
 4. **Deploy**:
    - Upload AAB to Google Play Internal Testing.
@@ -77,8 +74,8 @@ Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto for
 ## Usage
 - Plug in adapter → auto-connect.
 - Settings: Immersive mode, audio routing, mic source, WiFi band.
-- **Reset Video Stream**: Instant video recovery from black screen.
 - **Reset Device** (red button): Full USB session restart.
+- **Reboot Adapter**: Reboots the CPC200 adapter itself.
 
 ## Contributing
 - Fork and open PRs for fixes or enhancements.
@@ -86,6 +83,8 @@ Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto for
 - Include logs when reporting issues.
 
 ## Changelog (Recent Builds)
+- **Upstream sync** (October 2026): Merged lvalen91/carlink through build 145 + decoder size probe (PR #14). Upstream fixes supersede this fork's Build 52–61 video changes.
+- **Build 61** (January 11, 2026): Post-reconnect pixelation/distortion fix.
 - **Build 52** (January 4, 2026): Additional keyframe requests on resume; significant black screen reduction.
 - See commit history for earlier changes.
 

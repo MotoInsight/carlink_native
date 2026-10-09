@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="502"
+    android:viewportHeight="481">
+
+    <!-- Blue triangle background -->
+    <path
+        android:pathData="M32.333,416.667c-17.68,0 -32,-14.32 -32,-32c0,-5.814 1.547,-11.28 4.267,-15.974L207.267,16.693C212.787,7.12 223.133,0.667 235,0.667s22.213,6.453 27.733,16.026l202.667,352c2.72,4.694 4.267,10.16 4.267,15.974c0,17.68 -14.32,32 -32,32z"
+        android:fillColor="#03A9F4"/>
+
+    <!-- Darker left half -->
+    <path
+        android:pathData="M207.267,16.693L4.6,368.693c-2.72,4.694 -4.267,10.16 -4.267,15.974c0,17.68 14.32,32 32,32h202.667V0.667c-11.867,0 -22.213,6.453 -27.733,16.026z"
+        android:fillColor="#039BE5"/>
+
+    <!-- White arrow/road -->
+    <path
+        android:pathData="M235,150l181.333,320l-10.666,10.667l-170.667,-64l-170.667,64l-10.666,-10.667z"
+        android:fillColor="#F1F1F1"/>
+
+    <!-- Slightly darker right half of arrow -->
+    <path
+        android:pathData="M235,150l181.333,320l-10.666,10.667l-170.667,-64z"
+        android:fillColor="#E1E1E1"/>
+
+</vector>
