@@ -56,19 +56,19 @@ enum class AudioSourceConfig {
     /**
      * Bluetooth mode - Audio plays through phone's Bluetooth to car stereo.
      * Sends AUDIO_TRANSFER_ON during initialization.
+     * This is the default for first launch (FULL init).
      */
     BLUETOOTH,
 
     /**
      * Adapter mode - Audio streams through USB to be played by this app.
      * Sends AUDIO_TRANSFER_OFF during initialization.
-     * This is the default for first launch (FULL init).
      */
     ADAPTER,
     ;
 
     companion object {
-        val DEFAULT = ADAPTER
+        val DEFAULT = BLUETOOTH
     }
 }
 
@@ -400,7 +400,7 @@ class AdapterConfigPreference private constructor(
 
     val audioSourceFlow: Flow<AudioSourceConfig> =
         dataStore.data.map { preferences ->
-            val isBluetooth = preferences[KEY_AUDIO_SOURCE_BLUETOOTH] ?: false
+            val isBluetooth = preferences[KEY_AUDIO_SOURCE_BLUETOOTH] ?: true
             if (isBluetooth) AudioSourceConfig.BLUETOOTH else AudioSourceConfig.ADAPTER
         }
 
@@ -414,7 +414,7 @@ class AdapterConfigPreference private constructor(
      * onCreate to hop off the main thread. Applies equally to all `get*Sync()` methods below.
      */
     fun getAudioSourceSync(): AudioSourceConfig {
-        val isBluetooth = syncCache.getBoolean(SYNC_CACHE_KEY_AUDIO_BLUETOOTH, false)
+        val isBluetooth = syncCache.getBoolean(SYNC_CACHE_KEY_AUDIO_BLUETOOTH, true)
         return if (isBluetooth) AudioSourceConfig.BLUETOOTH else AudioSourceConfig.ADAPTER
     }
 
@@ -837,7 +837,7 @@ class AdapterConfigPreference private constructor(
         companion object {
             val DEFAULT =
                 UserConfig(
-                    audioTransferMode = false, // ADAPTER is default
+                    audioTransferMode = true, // BLUETOOTH is default
                     micSource = MicSourceConfig.DEFAULT,
                     wifiBand = WiFiBandConfig.DEFAULT,
                     callQuality = CallQualityConfig.DEFAULT,
